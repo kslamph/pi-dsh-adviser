@@ -18,6 +18,8 @@
   allowlisted environment rather than pi's own.
 - Stores per-project adviser sessions under `~/.pi/agent/pi-dsh/projects/`, and writes the dsh
   profile's provider, model, and permission rows into the dsh home.
+- Also generates `~/.pi/agent/pi-dsh/disabled-tools.patch.yml` from `disabledTools` and passes it to
+  dsh as `--patch` on every run. Like the profile rows, it is regenerated: do not hand-edit it.
 
 ## 2. Check the environment first
 
@@ -45,8 +47,20 @@ in that file are preserved, but those three are not yours to change. Configure p
 Install the extension itself with:
 
 ```sh
-pi install <path-to-pi-dsh>
+pi install npm:pi-dsh-adviser
 ```
+
+| Source | Command | Behavior |
+|---|---|---|
+| npm | `pi install npm:pi-dsh-adviser` | Installed under Pi's npm directory |
+| local checkout | `pi install ./path-to-pi-dsh` | Loaded from that path without copying |
+| one run only | `pi -e ./path-to-pi-dsh` | Loaded for that invocation, not recorded in settings |
+
+`pi list` shows what is configured, `pi remove <source>` takes it out, `pi update --extensions`
+reconciles installed packages, and `--local`/`-l` writes to `.pi/settings.json` for the project
+instead of the user's personal settings. The first project-scoped install also needs `--approve`,
+because pi refuses to change an untrusted project's package config; expect that prompt rather than
+treating it as an error.
 
 | Dependency | How it is obtained | If missing |
 |---|---|---|
@@ -88,7 +102,7 @@ Provider and model tables are never read from the environment.
 | `maxResultChars` | no | `20000` | How much of an answer reaches pi; the full text is saved to a file |
 | `pruneAfterHours` | no | `168` | Inactivity hours before a session is pruned; `0` disables |
 | `purgeDsshSessions` | no | `false` | Also delete dsh's own session copy when a session is deleted or pruned |
-| `permissionMode` | no | `workspace-write` | File permissions for **new** sessions: `read-only`, `workspace-write`, or `danger-full-access`. Once a session has a mode, dsh records it in the session log and resolves that session's permissions from the record rather than from the environment, so it cannot be changed afterwards; pi-dsh refuses a follow-up that asks for a different mode. A bad value is an error, not a silent downgrade. `dsh_advise` is capped at `workspace-write`. |
+| `permissionMode` | no | `workspace-write` | File permissions for **new** sessions: `read-only`, `workspace-write`, or `danger-full-access`. dsh records a session's mode in its log — at creation, or at the first run that adopts the session — and resolves that session's permissions from the record rather than from the environment, so it cannot be changed afterwards; pi-dsh re-supplies the recorded mode on every follow-up and refuses a follow-up asking for a different one. A bad value is an error, not a silent downgrade. `dsh_advise` is capped at `workspace-write`. Exporting `DSH_PERMISSION_MODE` still overrides this for a `/dsh` command the user typed, never for a tool call. |
 | `disabledTools` | no | `[]` | dsh profile rows to disable for the adviser, e.g. `["tool-web", "tool-subagent"]`. Applied as a launcher overlay on every run, so unlike `permissionMode` it also affects existing sessions. |
 | `envAllowlist` | no | `[]` | Extra environment variable names to hand the adviser. The child gets an allowlist (the configured `apiKeyEnv` values, `DSH_*`, `PI_DSH_*`, `PATH`, `HOME`, locale) rather than pi's whole environment, so a plugin route's key must be named here. `/dsh-doctor` flags one that is missing. |
 | `dshProviders` | no | `[]` | Routes that dsh plugins provide, when automatic detection cannot find them |
@@ -172,7 +186,7 @@ If detection fails (routes registered at run time, or dsh changed its schema), a
 | `… needs MY_KEY in your environment — it is not set` | The key is unset or empty | Export it in the shell that starts pi |
 | `… needs X, which is not in envAllowlist` | A plugin route's key, which the scrubbed child environment does not carry | Add the variable name to `envAllowlist` |
 | `permissionMode must be one of read-only, workspace-write, danger-full-access` | A typo such as `readonly` | Write the mode exactly; pi-dsh refuses rather than guessing a safer one |
-| `dsh pins a session's permissions for life` | A follow-up asked for a different mode than the session was created with | Start a new session; a session's mode is fixed at creation |
+| `dsh pins a session's permissions for life` | A follow-up asked for a different mode than the session already holds | Start a new session; dsh records a session's mode and will not change it |
 | `there is no session #7 in this project` | Deleted, or pruned after `pruneAfterHours` | `/dsh-sessions`; start a new one with `/dsh` |
 | `the dsh turn failed: …` | dsh itself failed; the text is dsh's own | Read the message; run `/dsh-status` to confirm route and model |
 | `dsh exited with code … before reporting an outcome` | dsh died or the profile failed to boot | `/dsh-doctor`; check `dshProfile` is not a directory that already exists under another name |

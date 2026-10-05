@@ -15,11 +15,24 @@
 ## Install
 
 ```sh
-pi install <path-to-pi-dsh>
+pi install npm:pi-dsh-adviser
 ```
 
+That installs the published package into your personal Pi settings. To try it from a checkout
+instead — which loads the sources from that directory without copying them:
+
+```sh
+pi install ./path-to-pi-dsh        # or an absolute path
+pi -e ./path-to-pi-dsh             # load it for one run, without recording it
+```
+
+`pi list` shows what is configured, `pi remove <source>` takes it out again, and `pi update
+--extensions` reconciles installed packages. Add `--local` (or `-l`) to any of these to use
+`.pi/settings.json` for the project instead of your personal settings; the first time you do that in
+an untrusted project, pi asks you to add `--approve`, which is expected.
+
 Pi loads the extension from `index.ts` directly; there is nothing to compile and no runtime
-dependency to install.
+dependency to install. It needs Node 22.19 or newer (`engines` in `package.json`).
 
 ### The dsh runtime
 
@@ -76,8 +89,9 @@ Three environment variables override one scalar each, for the things you switch 
 `PI_DSH_DSH_PROFILE` (dsh profile name), `PI_DSH_PROJECTS_DIR`, and `PI_DSH_DEFAULT_MODEL`
 (`provider/id`). Everything else, including every optional field — `dshProfile`, `dshPackage`,
 `projectsDir`, `timeoutMs`, `maxResultChars`, `pruneAfterHours`, `purgeDsshSessions`,
-`dshProviders` — is documented in [LLMS.txt](./LLMS.txt), the reference for you and for an agent
-configuring this for you.
+`permissionMode`, `disabledTools`, `envAllowlist`, `dshProviders` — is documented in
+[LLMS.txt](./LLMS.txt), the reference for you and for an agent configuring this for you. The last
+three are covered under [What the adviser may do](#what-the-adviser-may-do).
 
 `/dsh-model` changes the default model and saves it into `config.json` (keeping the previous file
 once as `config.json.bak`), so you rarely need to edit that key by hand.
@@ -91,7 +105,7 @@ once as `config.json.bak`), so you rarely need to edit that key by hand.
 | `/dsh-follow #<n> <text>` | Continue one particular session |
 | `/dsh-sessions` | List this project's sessions and when each was last used |
 | `/dsh-delete #<n>` | Delete one adviser session, after you confirm |
-| `/dsh-status` | Project, sessions, model, dsh profile, which dsh route is in use |
+| `/dsh-status` | Project, sessions, model, permission mode, dsh profile, route, disabled rows |
 | `/dsh-model [provider/model]` | Show the models you can use, or switch to one |
 | `/dsh-doctor` | Check everything below and report what is wrong in plain language |
 
@@ -151,6 +165,11 @@ session instead. `/dsh-status` shows the mode new sessions get and the modes exi
 
 The `dsh_advise` tool is capped at `workspace-write`: a model cannot widen its own permissions to
 `danger-full-access`, though you can set that mode yourself for `/dsh`.
+
+Exporting dsh's own `DSH_PERMISSION_MODE` still overrides `permissionMode` for a `/dsh` command you
+typed yourself — that is the documented dsh escape hatch and pi-dsh does not take it away. It is
+ignored for tool calls, where the `mode` parameter and your configured default decide. `/dsh-status`
+always shows the mode actually in force.
 
 Every run reports which project files it changed, by comparing the tree before and after the run.
 Writes outside the project — `/tmp`, for instance — do not appear in that list.
@@ -213,8 +232,9 @@ route, and the symptom-to-fix table above.
 ## Development
 
 ```sh
-node --test tests/*.test.ts
+npm test              # node --test tests/*.test.ts
+npm run typecheck     # tsc --noEmit
 ```
 
 The suite needs no network, no `dsh`, and no real configuration: it injects a temporary home, a fake
-`PATH`, and captured dsh output.
+`PATH` carrying a stub `dsh`, and captured dsh output.
