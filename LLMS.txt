@@ -1,0 +1,177 @@
+# pi-dsh
+
+> Reference for coding agents configuring or troubleshooting this Pi extension. pi-dsh turns a second
+> agent — the DeepSeek Harness (`dsh`) — into an adviser that answers from its own clean context.
+> Sessions belong to the project directory pi was started in. This file tells you how to check that
+> a user's environment is ready, what they can configure, how to configure it, and how to fix what
+> breaks. Do not ask the user questions you can answer from here; do not edit generated files.
+
+## 1. What this extension does
+
+- Registers commands: `/dsh`, `/dsh-follow`, `/dsh-sessions`, `/dsh-delete`, `/dsh-status`,
+  `/dsh-model`, `/dsh-doctor`.
+- Registers one model-callable tool, `dsh_advise({ task, followUp?, sessionIndex?, timeoutMs? })`.
+- Runs `dsh` as a child process per turn. pi-dsh owns only the provider route and the model; dsh owns
+  the loop, tools, session log, and permissions.
+- Stores per-project adviser sessions under `~/.pi/agent/pi-dsh/projects/`, and writes the dsh
+  profile's provider and model rows into the dsh home.
+
+## 2. Check the environment first
+
+Ask the user to run these, in this order, and read the output before changing anything:
+
+1. `pi list` — is the extension installed at all?
+2. `/dsh-doctor` — the single authoritative check. It reports: configuration loaded (or the exact
+   reason it is not), dsh reachable and by which route, dsh profile created and its patch path,
+   every configured provider key present in the environment, and the plugin routes it found.
+3. `/dsh-status` — project path, session count, effective model and where that model came from
+   (config file or `PI_DSH_DEFAULT_MODEL`), the dsh profile, and the resolved dsh route.
+4. `/dsh <reply with OK, do not use tools>` — a live run. Only do this if the user wants a real
+   check; it costs a model call.
+
+Never edit `~/.dsh/profiles/<profile>/cordis.patch.yml`. pi-dsh rewrites the `llm-pi-ai` and
+`agent-default-model` rows from the user's config on every run; hand-written rows in that file are
+preserved, but those two are not yours to change. Configure providers in the user's config file
+instead.
+
+## 3. Dependencies
+
+Install the extension itself with:
+
+```sh
+pi install <path-to-pi-dsh>
+```
+
+| Dependency | How it is obtained | If missing |
+|---|---|---|
+| Pi | The host application; `pi list` shows whether the extension is installed | Nothing runs |
+| `dsh` (DeepSeek Harness) | `dsh` on `PATH`, else fetched through `npx -y @deepseek-ai/dsh@<pinned version>` | `/dsh-doctor` says `could not find dsh`; fix with `npm i -g @deepseek-ai/dsh` or by making the `npx` route work (network or proxy) |
+| Node.js | Required by Pi | — |
+
+`typebox` is a peer dependency Pi already provides. pi-dsh has no runtime dependencies of its own and
+needs no build step; Pi runs the TypeScript sources directly.
+
+Provider plugins are optional and are installed by the user, never by pi-dsh:
+
+```sh
+dsh plugin --profile <dshProfile> add <package>
+```
+
+## 4. Configuration
+
+One file: `~/.pi/agent/pi-dsh/config.json`. It is created from the extension's `config.example.json`
+on first load. It must be valid JSON — no comments, no trailing commas.
+
+Precedence, highest wins:
+
+1. the three environment variables below (each replaces exactly one scalar);
+2. `config.json`.
+
+Provider and model tables are never read from the environment.
+
+### Fields
+
+| Field | Required | Default | Meaning |
+|---|---|---|---|
+| `providers` | yes | — | Object of provider routes, keyed by the name used in `<provider>/<model>` |
+| `model` | yes | — | `{ "provider": …, "id": … }`, naming one of the routes above |
+| `dshProfile` | no | `pi-advisor` | Name of the dsh profile directory pi-dsh maintains |
+| `dshPackage` | no | `@deepseek-ai/dsh@0.2.0-rc.2` | Package spec for the `npx` fallback; keep it pinned |
+| `projectsDir` | no | `~/.pi/agent/pi-dsh/projects` | Root of the per-project session stores |
+| `timeoutMs` | no | `900000` | Wall-clock limit for one run; a thinking model with tools wants minutes |
+| `maxResultChars` | no | `20000` | How much of an answer reaches pi; the full text is saved to a file |
+| `pruneAfterHours` | no | `168` | Inactivity hours before a session is pruned; `0` disables |
+| `purgeDsshSessions` | no | `false` | Also delete dsh's own session copy when a session is deleted or pruned |
+| `dshProviders` | no | `[]` | Routes that dsh plugins provide, when automatic detection cannot find them |
+
+### Provider route shape
+
+```jsonc
+"myprovider": {
+  "displayName": "My Provider",                 // optional
+  "apiKeyEnv": "MY_PROVIDER_API_KEY",           // required: env var holding the key
+  "api": "openai-completions",                  // required: openai-completions | openai-responses | anthropic-messages
+  "baseURL": "https://api.example.com/v1",      // required
+  "compat": { "maxTokensField": "max_tokens" }, // optional
+  "headers": { "X-Title": "My Tool" },          // optional
+  "models": [                                   // required, at least one
+    { "id": "some-model", "name": "Some Model", "input": ["text"], "contextWindow": 200000, "maxTokens": 8000 }
+  ]
+}
+```
+
+`input` may contain `text` and `image`. `contextWindow` and `maxTokens` are optional but strongly
+recommended: without them a thinking model's output can be truncated silently.
+
+### Environment overrides
+
+- `PI_DSH_DSH_PROFILE` — the dsh profile name.
+- `PI_DSH_PROJECTS_DIR` — where session stores live.
+- `PI_DSH_DEFAULT_MODEL` — `provider/id`. This wins over the config file; `/dsh-model` warns the
+  user when it is set, and `/dsh-status` shows `model source`.
+
+### Keys
+
+Keep keys out of `config.json`. Name the environment variable in `apiKeyEnv` and have the user
+export it in the shell that starts pi. If a key lives in a `.env` file that is not exported, runs fail
+at the provider, not at load time — `/dsh-doctor` catches this before a run is wasted.
+
+## 5. Changing the model
+
+Prefer the command: `/dsh-model <provider>/<model>`. It validates the choice, rewrites the dsh
+profile row, and saves `model` into `config.json`, leaving the previous file as `config.json.bak`.
+The user should not hand-edit the profile row: it is regenerated from the config on every run.
+
+`/dsh-model` with no argument lists what is available: pi-ai routes with their models, then a
+`routes from dsh plugins:` section. Tab-completion offers both. Plugin-route model ids cannot be
+listed in advance (the lineup is fetched at run time), so the model id is passed through to dsh and
+a wrong one surfaces as dsh's own error.
+
+## 6. Plugin-provided providers
+
+A provider that ships as a dsh plugin registers its own adapter and cannot be described by a static
+route block. After the user runs `dsh plugin --profile <dshProfile> add <package>`:
+
+- `/dsh-model` lists the routes it contributes;
+- `/dsh-doctor` reports each route and the credential variable it needs (for example
+  `OPENCODE_API_KEY`), so check those too;
+- `/dsh-model <route>/<model>` switches to one, exactly like a pi-ai route.
+
+If detection fails (routes registered at run time, or dsh changed its schema), add the route names to
+`dshProviders` in the config.
+
+## 7. Sessions
+
+- One project path owns one list of sessions. Sessions are keyed on the exact working directory, so a
+  subdirectory is a different project with its own sessions.
+- `/dsh` always starts a new session and prints its index; `/dsh-follow <text>` continues the latest;
+  `/dsh-follow #<n> <text>` continues that one.
+- Indices are never reused, so a deleted `#2` does not renumber `#3`.
+- `/dsh-delete #<n>` asks first and removes only that project's session.
+- Storage: `~/.pi/agent/pi-dsh/projects/<readable-path-digest>/` with `sessions.json`, `runs.jsonl`,
+  and `runs/<n>-<run>.md`.
+
+## 8. Symptoms and fixes
+
+| Message the user sees | Cause | Fix |
+|---|---|---|
+| `could not find dsh on your PATH` | No `dsh`, and the `npx` fallback is not configured or not reachable | `npm i -g @deepseek-ai/dsh`, or fix network/proxy so `npx -y @deepseek-ai/dsh@…` works |
+| `I created your configuration at …` | First run; the file came from the template and is empty of providers | Add a `providers` entry and a `model`, as in §4 |
+| `no usable provider is configured` | `providers` is empty, or a route is missing `apiKeyEnv`, `api`, `baseURL`, or `models` | Fix the field the message names |
+| `your configuration file is not valid JSON` | Trailing comma, comment, or unquoted key | Rewrite as strict JSON; pi-dsh will not guess |
+| `your configuration file must contain a JSON object` | The file contains an array or a scalar | Wrap it in one object |
+| `… needs MY_KEY in your environment — it is not set` | The key is unset or empty | Export it in the shell that starts pi |
+| `there is no session #7 in this project` | Deleted, or pruned after `pruneAfterHours` | `/dsh-sessions`; start a new one with `/dsh` |
+| `the dsh turn failed: …` | dsh itself failed; the text is dsh's own | Read the message; run `/dsh-status` to confirm route and model |
+| `dsh exited with code … before reporting an outcome` | dsh died or the profile failed to boot | `/dsh-doctor`; check `dshProfile` is not a directory that already exists under another name |
+| A model switch appears not to stick | `PI_DSH_DEFAULT_MODEL` is set and overrides the file | Unset it or update the variable |
+
+## 9. How to help, safely
+
+- Change configuration in `~/.pi/agent/pi-dsh/config.json` only. Never in the extension directory,
+  and never in `~/.dsh`.
+- Prefer `/dsh-model` over editing `model` by hand; it validates and backs up.
+- Read `/dsh-doctor` output instead of guessing. Quote its exact field or variable name back to the
+  user rather than paraphrasing.
+- Do not lower `pruneAfterHours` without saying so: it deletes session history the user may want.
+- After any configuration change, confirm with `/dsh-status`, not with a full model run.

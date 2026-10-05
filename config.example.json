@@ -1,0 +1,10 @@
+{
+  "dshProfile": "pi-advisor",
+  "dshPackage": "@deepseek-ai/dsh@0.2.0-rc.2",
+  "providers": {},
+  "model": { "provider": "REPLACE_ME", "id": "REPLACE_ME" },
+  "timeoutMs": 900000,
+  "maxResultChars": 20000,
+  "pruneAfterHours": 168,
+  "purgeDsshSessions": false
+}

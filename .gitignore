@@ -1,0 +1,8 @@
+node_modules/
+.pi/
+.worktrees/
+*.tmp
+*.tgz
+
+# Working-tree documents — specs, plans, and local notes are never pushed.
+/docs/
