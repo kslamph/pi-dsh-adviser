@@ -2,7 +2,7 @@ import { test } from "node:test"
 import assert from "node:assert/strict"
 import { resolveDshCommand, resetDshCommandCache, dshCommandFor } from "../resolve.ts"
 import type { DshConfig } from "../config.ts"
-import { withTempHome } from "./helpers.ts"
+import { fakeDshPathDir, withPath, withTempHome } from "./helpers.ts"
 
 function config(overrides: Partial<DshConfig> = {}): DshConfig {
   return {
@@ -45,27 +45,23 @@ test("a configured dshPackage overrides the pinned fallback spec", () => {
   assert.deepEqual(command.args, ["-y", "@deepseek-ai/dsh@9.9.9"])
 })
 
-test("resolveDshCommand never consults the cache but dshCommandFor does", () => {
+test("resolveDshCommand never consults the cache but dshCommandFor does", async () => {
   withTempHome()
+  // A stub dsh on a private PATH makes the `path` route deterministic here; relying on the
+  // machine's own PATH made this test pass only where dsh happened to be installed.
+  const first = await withPath("/nonexistent-bin", () => {
+    resetDshCommandCache()
+    const resolved = dshCommandFor(config())
+    assert.equal(resolved.route, "npx")
+    return resolved
+  })
+  await withPath(fakeDshPathDir(), () => {
+    const cached = dshCommandFor(config())
+    assert.deepEqual(cached, first, "the cached command is reused even after PATH changes")
+    resetDshCommandCache()
+    assert.equal(dshCommandFor(config()).route, "path", "a fresh resolution sees the stub")
+  })
   resetDshCommandCache()
-  let calls = 0
-  const original = process.env.PATH
-  process.env.PATH = "/nonexistent-bin"
-  try {
-    // dshCommandFor resolves through the real `which`, so point PATH somewhere without dsh.
-    const first = dshCommandFor(config())
-    assert.equal(first.route, "npx")
-    process.env.PATH = `${original ?? ""}`
-    const second = dshCommandFor(config())
-    assert.deepEqual(second, first, "the cached command is reused even after PATH changes")
-    calls += 1
-    resetDshCommandCache()
-    assert.equal(dshCommandFor(config()).route, "path")
-  } finally {
-    process.env.PATH = original
-    resetDshCommandCache()
-  }
-  assert.equal(calls, 1)
 })
 
 test("with no dsh anywhere the error names both install routes", () => {

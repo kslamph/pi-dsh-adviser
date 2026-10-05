@@ -3,6 +3,8 @@ import assert from "node:assert/strict"
 import { readFileSync } from "node:fs"
 import { dirname, join } from "node:path"
 import { discoverDshRoutes, dshRoutesFor, resetDshRouteCache } from "../dshRoutes.ts"
+import { resetDshCommandCache } from "../resolve.ts"
+import { fakeDshPathDir, withPath } from "./helpers.ts"
 import type { DshConfig } from "../config.ts"
 
 const fixture = readFileSync(
@@ -107,9 +109,14 @@ test("schema output with no entries is not an error, just no routes", () => {
   assert.equal(result.error, undefined)
 })
 
-test("discovery invokes dsh with the profile and the schema flag", () => {
+test("discovery invokes dsh with the profile and the schema flag", async () => {
   const calls: { command: string; args: string[] }[] = []
-  discoverDshRoutes(config({ dshProfile: "pi-advisor" }), spawner(ok(fixture), calls))
+  // Discovery resolves the dsh command through the real PATH, so a stub keeps the assertion
+  // about *how* dsh is invoked independent of whether the machine running the suite has dsh.
+  await withPath(fakeDshPathDir(), () => {
+    resetDshCommandCache()
+    discoverDshRoutes(config({ dshProfile: "pi-advisor" }), spawner(ok(fixture), calls))
+  }).finally(() => resetDshCommandCache())
   assert.equal(calls.length, 1)
   assert.deepEqual(calls[0], {
     command: "dsh",

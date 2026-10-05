@@ -1,6 +1,6 @@
 import { test } from "node:test"
 import assert from "node:assert/strict"
-import { mkdtempSync, mkdirSync, readFileSync, writeFileSync, existsSync } from "node:fs"
+import { chmodSync, mkdtempSync, mkdirSync, readFileSync, writeFileSync, existsSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 
@@ -36,4 +36,40 @@ export function minimalConfig(overrides: Record<string, unknown> = {}): Record<s
 /** Read a file that a test expects to exist. */
 export function readIfPresent(path: string): string | undefined {
   return existsSync(path) ? readFileSync(path, "utf8") : undefined
+}
+
+/**
+ * A PATH entry holding an executable stub named `dsh`.
+ *
+ * `resolveDshCommand` finds dsh by asking the real PATH whether the file is
+ * executable, so a stub is enough to force the `path` route. Without this, a test
+ * that asserts "dsh is used directly" passes only on a machine that happens to
+ * have dsh installed and fails on CI, where nothing is installed.
+ *
+ * @returns the directory to put on PATH
+ */
+export function fakeDshPathDir(): string {
+  const dir = mkdtempSync(join(tmpdir(), "pi-dsh-path-"))
+  const stub = join(dir, "dsh")
+  writeFileSync(stub, "#!/bin/sh\nexit 0\n")
+  chmodSync(stub, 0o755)
+  return dir
+}
+
+/**
+ * Run a body with PATH set to `entries`, then restore the previous value.
+ *
+ * @param entries - the PATH to use, colon-separated
+ * @param body - what to run
+ * @returns whatever the body returns
+ */
+export async function withPath<T>(entries: string, body: () => T | Promise<T>): Promise<T> {
+  const original = process.env.PATH
+  process.env.PATH = entries
+  try {
+    return await body()
+  } finally {
+    if (original === undefined) delete process.env.PATH
+    else process.env.PATH = original
+  }
 }
