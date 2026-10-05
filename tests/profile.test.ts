@@ -3,7 +3,7 @@ import assert from "node:assert/strict"
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
-import { ensureProfile, setModel, profilePatchPath, profileDir, dshSessionsRoot } from "../config.ts"
+import { ensureProfile, setModel, profilePatchPath, profileDir, dshSessionsRoot, ensureCapabilityPatch, capabilityPatchPath } from "../config.ts"
 import type { DshConfig } from "../config.ts"
 import type { DshCommand } from "../resolve.ts"
 
@@ -12,6 +12,8 @@ const NPX_DSH: DshCommand = { command: "npx", args: ["-y", "@deepseek-ai/dsh@0.2
 
 function setup(): DshConfig {
   const home = mkdtempSync(join(tmpdir(), "pi-dsh-home-"))
+  // The capability overlay lives under pi-dsh's own state dir, which the test home redirects.
+  process.env.PI_DSH_TEST_HOME = home
   process.env.DSH_HOME = join(home, "dsh")
   return {
     dshProfile: "pi-advisor",
@@ -31,6 +33,9 @@ function setup(): DshConfig {
     maxResultChars: 20_000,
     pruneAfterHours: 168,
     purgeDsshSessions: false,
+    permissionMode: "workspace-write",
+    disabledTools: [],
+    envAllowlist: [],
     dshProviders: [],
     modelSource: "config file" as const,
   }
@@ -104,4 +109,38 @@ test("dsh sessions live under the configured DSH_HOME", () => {
   const config = setup()
   assert.equal(dshSessionsRoot(), join(process.env.DSH_HOME as string, "sessions"))
   assert.ok(!existsSync(dshSessionsRoot()) || readFileSync === readFileSync)
+})
+
+test("the permission preset row makes a read-only adviser stop asking for approval", () => {
+  const config = setup()
+  const { fn } = recorder()
+  ensureProfile(config, PATH_DSH, fn)
+  const document = readFileSync(profilePatchPath("pi-advisor"), "utf8")
+  assert.match(document, /- id: permission/)
+  assert.match(document, /name: "@deepseek-ai\/dsh-permission-presets"/)
+  // dsh's own table pairs read-only with `ask`, which in an unattended run can only ever
+  // resolve `unavailable`. The point of owning this row is the approval half.
+  assert.match(document, /read-only:\n\s+sandbox: read-only\n\s+approval: never/)
+  assert.match(document, /workspace-write:\n\s+sandbox: workspace-write/)
+  assert.match(document, /danger-full-access:\n\s+sandbox: danger-full-access/)
+})
+
+test("the permission row is restated in full, so no preset is lost to a replacing patch", () => {
+  const config = setup()
+  const { fn } = recorder()
+  ensureProfile(config, PATH_DSH, fn)
+  const rows = readFileSync(profilePatchPath("pi-advisor"), "utf8")
+  for (const preset of ["read-only", "workspace-write", "danger-full-access"]) {
+    assert.ok(rows.includes(`${preset}:`), `${preset} must survive pi-dsh's row`)
+  }
+})
+
+test("no capability overlay is written when nothing is disabled, and it is removed once it was", () => {
+  const config = setup()
+  assert.equal(ensureCapabilityPatch(config), undefined)
+  const path = ensureCapabilityPatch({ ...config, disabledTools: ["tool-web"] })
+  assert.equal(path, capabilityPatchPath())
+  assert.match(readFileSync(path as string, "utf8"), /- id: tool-web\n {2}disabled: true/)
+  assert.equal(ensureCapabilityPatch(config), undefined)
+  assert.equal(existsSync(path as string), false, "the overlay is removed rather than left behind")
 })

@@ -6,12 +6,12 @@
  * serves it, and remembers which dsh session the last run left open.
  *
  * Profile writes are row-scoped: the extension replaces only the rows it owns
- * (`llm-pi-ai` and `agent-default-model`) and leaves every other row in the
- * patch document byte-identical, so a profile shared with hand-written overrides
- * survives a model switch.
+ * (`llm-pi-ai`, `agent-default-model`, and `permission`) and leaves every other
+ * row in the patch document byte-identical, so a profile shared with
+ * hand-written overrides survives a model switch.
  */
 
-import { copyFileSync, mkdirSync, readFileSync, renameSync, writeFileSync, existsSync } from "node:fs"
+import { copyFileSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync, existsSync } from "node:fs"
 import { spawnSync } from "node:child_process"
 import { homedir } from "node:os"
 import { dirname, join } from "node:path"
@@ -30,6 +30,23 @@ export interface ModelSpec {
    */
   input?: ("text" | "image")[]
 }
+
+/**
+ * A file-permission mode, spelled as dsh's `sandbox-policy` spells it.
+ *
+ * dsh records a session's mode in the session's own log — at creation, or at the first
+ * boot that lists the session — and every later run of that session resolves its
+ * permissions from that record rather than from the deployment default. pi-dsh therefore
+ * records the mode on the session record, re-supplies it on every follow-up, and refuses
+ * to resume a session under a different one.
+ */
+export type PermissionMode = "read-only" | "workspace-write" | "danger-full-access"
+
+/** Every mode dsh accepts, in the order `/dsh-status` lists them. */
+export const PERMISSION_MODES: readonly PermissionMode[] = ["read-only", "workspace-write", "danger-full-access"]
+
+/** The widest mode a model-initiated run is ever allowed to ask for. */
+export const MODEL_RUN_MAX_MODE: PermissionMode = "workspace-write"
 
 /** One provider route written into the dsh profile. */
 export interface ProviderSpec {
@@ -62,6 +79,17 @@ export interface DshConfig {
   pruneAfterHours: number
   /** Whether deletion also removes dsh's own session directory. */
   purgeDsshSessions: boolean
+  /** File-permission mode a new adviser session runs under, and keeps. */
+  permissionMode: PermissionMode
+  /** dsh profile row ids to disable for the adviser, such as `tool-web`. */
+  disabledTools: string[]
+  /**
+   * Extra environment variable names to hand the adviser, beyond the provider
+   * keys pi already knows about. The child gets an allowlist rather than a copy of
+   * pi's environment, so a route whose key pi cannot infer — a dsh plugin's, say —
+   * has to be named here.
+   */
+  envAllowlist: string[]
   /** Provider routes that dsh plugins contribute and pi-dsh must not try to describe itself. */
   dshProviders: string[]
   /** Whether the effective model came from the config file or an environment override. */
@@ -105,6 +133,58 @@ export function profileDir(profile: string): string {
   return join(dshHome(), "profiles", profile)
 }
 
+/**
+ * Absolute path of the launcher overlay that disables configured dsh rows.
+ *
+ * This is a separate document from the profile's own patch because it is not
+ * profile state: it is one file passed as `--patch` on a single run, which is the
+ * only capability lever that is *not* pinned into the session log by dsh. Tool
+ * availability is a static row property, so disabling a row this way survives
+ * session resume — unlike the sandbox mode, which dsh records per session.
+ *
+ * @returns the overlay path
+ */
+export function capabilityPatchPath(): string {
+  return join(userStateDir(), "disabled-tools.patch.yml")
+}
+
+/**
+ * Write the launcher overlay that disables the configured dsh rows, if any.
+ *
+ * Tool enablement is a profile-row property rather than a session permission, so
+ * this is the one capability control that reaches a resumed session. Writing is
+ * skipped when the file already says the same thing, so an unchanged config does
+ * not churn the file on every run.
+ *
+ * @param config - the configuration naming the rows to disable
+ * @returns the overlay path, or undefined when nothing is disabled
+ */
+export function ensureCapabilityPatch(config: DshConfig): string | undefined {
+  const path = capabilityPatchPath()
+  if (config.disabledTools.length === 0) {
+    rmSync(path, { force: true })
+    return undefined
+  }
+  const lines = [
+    "# Written by the pi-dsh extension from the `disabledTools` field of your config.json.",
+    "# Passed to dsh as --patch on every adviser run. Safe to delete: pi-dsh rewrites it.",
+    ...config.disabledTools.map((id) => `- id: ${id}\n  disabled: true`),
+    "",
+  ]
+  const document = lines.join("\n")
+  let existing: string | undefined
+  try {
+    existing = readFileSync(path, "utf8")
+  } catch {
+    existing = undefined
+  }
+  if (existing !== document) {
+    mkdirSync(dirname(path), { recursive: true })
+    writeFileSync(path, document)
+  }
+  return path
+}
+
 /** Absolute path of the directory holding dsh's own session logs. */
 export function dshSessionsRoot(): string {
   return join(dshHome(), "sessions")
@@ -118,6 +198,7 @@ const DEFAULTS = {
   maxResultChars: 20_000,
   pruneAfterHours: 168,
   purgeDsshSessions: false,
+  permissionMode: "workspace-write",
 } as const
 
 /**
@@ -178,6 +259,9 @@ export function loadConfig(): DshConfig {
   if (config.model?.id === undefined) {
     throw new Error(configError("no default model is configured", "model.id"))
   }
+  const permissionMode = parsePermissionMode(config.permissionMode)
+  const disabledTools = parseDisabledTools(config.disabledTools)
+  const envAllowlist = parseEnvAllowlist(config.envAllowlist)
 
   const envProfile = process.env.PI_DSH_DSH_PROFILE
   const envProjectsDir = process.env.PI_DSH_PROJECTS_DIR
@@ -197,6 +281,9 @@ export function loadConfig(): DshConfig {
     maxResultChars: config.maxResultChars ?? DEFAULTS.maxResultChars,
     pruneAfterHours: config.pruneAfterHours ?? DEFAULTS.pruneAfterHours,
     purgeDsshSessions: config.purgeDsshSessions ?? DEFAULTS.purgeDsshSessions,
+    permissionMode,
+    disabledTools,
+    envAllowlist,
     dshProviders: config.dshProviders ?? [],
     modelSource: envOverride === undefined ? "config file" : "PI_DSH_DEFAULT_MODEL",
   }
@@ -236,6 +323,76 @@ export function saveModel(config: DshConfig, model: { provider: string; id: stri
   renameSync(tempPath, path)
   void config
   return { path, backupPath }
+}
+
+/**
+ * Validate a configured permission mode, falling back to the documented default.
+ *
+ * A bad value is a configuration error rather than a silent downgrade: a user who
+ * wrote `readonly` and got `workspace-write` would have no idea their second
+ * opinion could edit their files.
+ *
+ * @param value - the configured value, possibly absent
+ * @returns the mode to use
+ * @throws when the value is present but is not a mode dsh accepts
+ */
+function parsePermissionMode(value: unknown): PermissionMode {
+  if (value === undefined) return DEFAULTS.permissionMode
+  if (typeof value === "string" && (PERMISSION_MODES as readonly string[]).includes(value)) {
+    return value as PermissionMode
+  }
+  throw new Error(
+    configError(
+      `\`permissionMode\` must be one of ${PERMISSION_MODES.join(", ")}, not ${JSON.stringify(value)}`,
+      "permissionMode",
+    ),
+  )
+}
+
+/**
+ * Validate the row ids to disable, which become dsh profile rows set to `disabled`.
+ *
+ * @param value - the configured list, possibly absent
+ * @returns the accepted row ids
+ * @throws when the value is not a list of plain row ids
+ */
+function parseDisabledTools(value: unknown): string[] {
+  if (value === undefined) return []
+  const list = Array.isArray(value) ? value : [value]
+  for (const entry of list) {
+    if (typeof entry !== "string" || !/^[a-z][a-z0-9-]*$/.test(entry)) {
+      throw new Error(
+        configError(
+          `\`disabledTools\` must be a list of dsh profile row ids such as "tool-web", not ${JSON.stringify(entry)}`,
+          "disabledTools",
+        ),
+      )
+    }
+  }
+  return [...new Set(list as string[])]
+}
+
+/**
+ * Validate the extra environment names to forward to the adviser.
+ *
+ * @param value - the configured list, possibly absent
+ * @returns the accepted names, deduplicated
+ * @throws when the value is not a list of environment variable names
+ */
+function parseEnvAllowlist(value: unknown): string[] {
+  if (value === undefined) return []
+  const list = Array.isArray(value) ? value : [value]
+  for (const entry of list) {
+    if (typeof entry !== "string" || !/^[A-Za-z_][A-Za-z0-9_]*$/.test(entry)) {
+      throw new Error(
+        configError(
+          `\`envAllowlist\` must be a list of environment variable names such as "OPENCODE_API_KEY", not ${JSON.stringify(entry)}`,
+          "envAllowlist",
+        ),
+      )
+    }
+  }
+  return [...new Set(list as string[])]
 }
 
 /**
@@ -325,6 +482,38 @@ function modelRow(model: { provider: string; id: string }): string {
 }
 
 /**
+ * Render the `permission` preset row.
+ *
+ * pi-dsh owns this row so a read-only adviser fails closed *and* stops asking.
+ * dsh's own table pairs `read-only` with `approval: ask`, which is the interactive
+ * choice: in an unattended run there is no answerer, so every escalation resolves
+ * `unavailable` and the model burns steps retrying a prompt nobody will ever see.
+ * `approval: never` refuses at the fence and tells the model not to escalate.
+ *
+ * Every preset is restated because a patch row replaces its config rather than
+ * merging into it, so naming only the one that differs would drop the other two.
+ *
+ * @returns the row's YAML lines, including the leading row id
+ */
+function permissionRow(): string {
+  return [
+    "- id: permission",
+    "  name: \"@deepseek-ai/dsh-permission-presets\"",
+    "  config:",
+    "    presets:",
+    "      read-only:",
+    "        sandbox: read-only",
+    "        approval: never",
+    "      workspace-write:",
+    "        sandbox: workspace-write",
+    "        approval: ask",
+    "      danger-full-access:",
+    "        sandbox: danger-full-access",
+    "        approval: never",
+  ].join("\n")
+}
+
+/**
  * Split a patch document into its top-level rows, keeping each row's text.
  *
  * @param document - the patch document
@@ -354,7 +543,7 @@ function splitRows(document: string): { header: string[]; rows: { id: string; te
 
 /** The comment block this extension writes at the top of every patch document it owns. */
 const MANAGED_HEADER = [
-  "# Managed in part by the pi-dsh extension: the llm-pi-ai and agent-default-model rows",
+  "# Managed in part by the pi-dsh extension: the llm-pi-ai, agent-default-model, and permission rows",
   "# are rewritten from pi-dsh config.json. Other rows are left untouched.",
 ]
 
@@ -395,6 +584,7 @@ export function ensureProfile(
   const owned = new Map<string, string>([
     ["llm-pi-ai", providerRow(config.providers)],
     ["agent-default-model", modelRow(config.model)],
+    ["permission", permissionRow()],
   ])
   const kept = rows.filter((row) => !owned.has(row.id))
   // Drop previously written managed header lines so repeated runs do not stack them up.

@@ -10,6 +10,8 @@ import type { DshConfig } from "../config.ts"
 
 function harness() {
   const home = mkdtempSync(join(tmpdir(), "pi-dsh-advise-"))
+  // pi-dsh's own state (the capability overlay) must stay inside the test home.
+  process.env.PI_DSH_TEST_HOME = home
   process.env.DSH_HOME = join(home, "dsh")
   const cwd = join(home, "work", "project")
   mkdirSync(cwd, { recursive: true })
@@ -23,6 +25,9 @@ function harness() {
     maxResultChars: 20000,
     pruneAfterHours: 168,
     purgeDsshSessions: false,
+    permissionMode: "workspace-write",
+    disabledTools: [],
+    envAllowlist: [],
     dshProviders: [],
     modelSource: "config file" as const,
   }
@@ -46,7 +51,7 @@ function harness() {
     setModel: () => "patch.yml",
     now: () => 1_800_000_000_000,
   }
-  return { deps, cwd, project: () => openProject(cwd, config.projectsDir) }
+  return { deps, cwd, config, project: () => openProject(cwd, config.projectsDir) }
 }
 
 test("without followUp the tool starts a new session and reports its index", async () => {
@@ -122,4 +127,54 @@ test("a run's artifact is named after the session index it belongs to", async ()
   project.remove(1)
   const { existsSync } = await import("node:fs")
   assert.equal(existsSync(result.details.artifactPath), false, "deleting the session takes its artifact with it")
+})
+
+test("mode: read-only creates the session read-only and says so in the answer", async () => {
+  const h = harness()
+  const advise = createAdvise(h.deps)
+  const result = await advise({ task: "just an opinion", mode: "read-only" }, h.cwd)
+  assert.equal(result.details.mode, "read-only")
+  assert.equal(h.project().get(1)?.mode, "read-only", "the mode is recorded, because dsh pins it for the session's life")
+  assert.match(result.text, /mode: read-only/)
+})
+
+test("the configured mode is the default when the caller names none", async () => {
+  const h = harness()
+  h.deps.loadConfig = () => ({ ...h.config, permissionMode: "read-only" })
+  const advise = createAdvise(h.deps)
+  const result = await advise({ task: "opinion" }, h.cwd)
+  assert.equal(result.details.mode, "read-only")
+})
+
+test("a follow-up that changes the mode is refused rather than silently ignored", async () => {
+  const h = harness()
+  const advise = createAdvise(h.deps)
+  await advise({ task: "first", mode: "read-only" }, h.cwd)
+  await assert.rejects(
+    () => advise({ task: "now write it", followUp: true, mode: "workspace-write" }, h.cwd),
+    (error: Error) => {
+      assert.match(error.message, /pins a/)
+      assert.match(error.message, /session #1/)
+      assert.match(error.message, /without followUp/)
+      return true
+    },
+  )
+  assert.equal(h.project().get(1)?.runs, 1, "the refused follow-up never ran")
+})
+
+test("a follow-up that keeps the mode continues normally", async () => {
+  const h = harness()
+  const advise = createAdvise(h.deps)
+  await advise({ task: "first", mode: "read-only" }, h.cwd)
+  const result = await advise({ task: "and now?", followUp: true, mode: "read-only" }, h.cwd)
+  assert.equal(result.details.sessionId, "session-gen1")
+})
+
+test("danger-full-access is not available to a model-initiated run", async () => {
+  const h = harness()
+  h.deps.loadConfig = () => ({ ...h.config, permissionMode: "danger-full-access" })
+  const advise = createAdvise(h.deps)
+  const result = await advise({ task: "touch production" }, h.cwd)
+  assert.equal(result.details.mode, "workspace-write", "capped")
+  assert.match(result.text, /capped at workspace-write/, "and the cap is explained, not hidden")
 })

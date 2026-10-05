@@ -63,6 +63,9 @@ test("documented defaults apply for every optional field", () => {
   assert.equal(config.maxResultChars, 20_000)
   assert.equal(config.pruneAfterHours, 168)
   assert.equal(config.purgeDsshSessions, false)
+  assert.equal(config.permissionMode, "workspace-write")
+  assert.deepEqual(config.disabledTools, [])
+  assert.deepEqual(config.envAllowlist, [])
 })
 
 test("each env override replaces exactly one scalar, and empty values are ignored", () => {
@@ -129,6 +132,51 @@ test("dshProviders defaults to empty and passes a declared list through", () => 
   assert.deepEqual(loadConfig().dshProviders, ["zenfree", "zenfree.res"])
 })
 
+test("permissionMode defaults to workspace-write and accepts every mode dsh accepts", () => {
+  const home = withTempHome()
+  clearEnv()
+  writeUserConfig(home, minimalConfig())
+  assert.equal(loadConfig().permissionMode, "workspace-write")
+  for (const mode of ["read-only", "workspace-write", "danger-full-access"]) {
+    writeUserConfig(home, minimalConfig({ permissionMode: mode }))
+    assert.equal(loadConfig().permissionMode, mode)
+  }
+})
+
+test("a misspelled permissionMode is an error, never a silent downgrade to a writable default", () => {
+  const home = withTempHome()
+  clearEnv()
+  writeUserConfig(home, minimalConfig({ permissionMode: "readonly" }))
+  assert.throws(
+    () => loadConfig(),
+    (error: Error) => {
+      assert.match(error.message, /permissionMode/)
+      assert.match(error.message, /read-only/)
+      return true
+    },
+  )
+})
+
+test("disabledTools and envAllowlist default to empty and pass a list through", () => {
+  const home = withTempHome()
+  clearEnv()
+  writeUserConfig(home, minimalConfig())
+  assert.deepEqual(loadConfig().disabledTools, [])
+  assert.deepEqual(loadConfig().envAllowlist, [])
+  writeUserConfig(home, minimalConfig({ disabledTools: ["tool-web", "tool-web"], envAllowlist: ["OPENCODE_API_KEY"] }))
+  assert.deepEqual(loadConfig().disabledTools, ["tool-web"], "deduplicated")
+  assert.deepEqual(loadConfig().envAllowlist, ["OPENCODE_API_KEY"])
+})
+
+test("a malformed disabledTools or envAllowlist entry names the field", () => {
+  const home = withTempHome()
+  clearEnv()
+  writeUserConfig(home, minimalConfig({ disabledTools: ["Tool Web"] }))
+  assert.throws(() => loadConfig(), /disabledTools/)
+  writeUserConfig(home, minimalConfig({ envAllowlist: ["not a name"] }))
+  assert.throws(() => loadConfig(), /envAllowlist/)
+})
+
 test("modelSource says whether the file or the environment supplied the model", () => {
   const home = withTempHome()
   clearEnv()
@@ -193,5 +241,8 @@ function minimalShape(): Partial<DshConfig> {
     maxResultChars: 1,
     pruneAfterHours: 1,
     purgeDsshSessions: false,
+    permissionMode: "workspace-write",
+    disabledTools: [],
+    envAllowlist: [],
   }
 }

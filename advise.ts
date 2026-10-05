@@ -10,10 +10,11 @@
  */
 
 import { pruneExpired } from "./prune.ts"
-import { openProject } from "./sessions.ts"
+import { modeOf, openProject } from "./sessions.ts"
 import type { Project, SessionRecord } from "./sessions.ts"
-import { runAdviser } from "./handlers.ts"
+import { resolveMode, runAdviser } from "./handlers.ts"
 import type { HandlerDeps, RunDetails } from "./handlers.ts"
+import type { PermissionMode } from "./config.ts"
 import type { RunResult } from "./runner.ts"
 
 /** What the tool is given. */
@@ -26,6 +27,13 @@ export interface AdviseParams {
   sessionIndex?: number
   /** Wall-clock limit for this run. */
   timeoutMs?: number
+  /**
+   * File-permission mode for a new session: `read-only` for a second opinion that
+   * must not touch the tree, `workspace-write` to let it run tests and scratch
+   * files. A session keeps the mode it was created with, so this cannot change a
+   * follow-up — mismatches are refused rather than silently ignored.
+   */
+  mode?: PermissionMode
 }
 
 /** What the tool returns. */
@@ -68,6 +76,8 @@ export function createAdvise(deps: AdviseDeps) {
     const config = deps.loadConfig()
     const project = deps.openProject(cwd)
     const sessions = project.list()
+    const resolved = resolveMode(config, params.mode, "model")
+    const mode = resolved.mode
 
     let target: SessionRecord | undefined
     if (params.followUp === true) {
@@ -89,6 +99,17 @@ export function createAdvise(deps: AdviseDeps) {
           )
         }
       }
+      // dsh writes the mode into the session log when the session is created and folds it
+      // back on every later run, so a mode change on resume would be a silent no-op. Refusing
+      // is the only honest option; the caller can start a new session instead.
+      const pinned = modeOf(target)
+      if (pinned !== mode) {
+        throw new Error(
+          `pi-dsh: adviser session #${target.index} of this project was created ${pinned}, and dsh pins a`
+          + ` session's permissions for the life of that session — it cannot continue as ${mode}.`
+          + ` Call me without followUp to start a ${mode} session, or drop \`mode\` to continue #${target.index} as ${pinned}.`,
+        )
+      }
     }
 
     // Retention runs here so an explicit target cannot be pruned before the run reads it.
@@ -100,13 +121,20 @@ export function createAdvise(deps: AdviseDeps) {
 
     const result = await runAdviser(deps, config, project, {
       task: params.task,
+      mode,
       ...(target === undefined ? {} : { sessionId: target.sessionId, index: target.index }),
       ...(params.timeoutMs === undefined ? {} : { timeoutMs: params.timeoutMs }),
       ...(params.signal === undefined ? {} : { signal: params.signal }),
       ...(params.onProgress === undefined ? {} : { onProgress: params.onProgress }),
     })
 
-    const continueHint = `\n\n[adviser session #${result.record.index} of this project — call me again with followUp: true${result.record.index === latestIndex(project) ? "" : `, sessionIndex: ${result.record.index}`} to continue this thread]`
+    const notes = [
+      `adviser session #${result.record.index} of this project`,
+      `mode: ${result.details.mode}`,
+      resolved.note ?? undefined,
+      `call me again with followUp: true${result.record.index === latestIndex(project) ? "" : `, sessionIndex: ${result.record.index}`} to continue this thread`,
+    ].filter((part): part is string => part !== undefined)
+    const continueHint = `\n\n[${notes.join(" — ")}]`
     return { text: `${result.text}${continueHint}`, details: result.details, usage: result.usage }
   }
 }

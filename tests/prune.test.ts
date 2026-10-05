@@ -25,10 +25,10 @@ function setup(): { projectsDir: string; dshHome: string; cwd: string } {
 function agedSessions(projectsDir: string, cwd: string) {
   process.env.PI_DSH_PROJECTS_DIR = projectsDir
   const project = openProject(cwd, projectsDir)
-  project.createSession({ sessionId: "session-at", title: "exactly at the boundary", model: "demo/m1" }, () => NOW - 168 * HOUR)
-  project.createSession({ sessionId: "session-under", title: "just under the boundary", model: "demo/m1" }, () => NOW - 168 * HOUR + 60_000)
-  project.createSession({ sessionId: "session-over", title: "just over the boundary", model: "demo/m1" }, () => NOW - 168 * HOUR - 60_000)
-  project.createSession({ sessionId: "session-old-latest", title: "ancient but latest", model: "demo/m1" }, () => NOW - 1000 * HOUR)
+  project.createSession({ sessionId: "session-at", title: "exactly at the boundary", model: "demo/m1", mode: "workspace-write" }, () => NOW - 168 * HOUR)
+  project.createSession({ sessionId: "session-under", title: "just under the boundary", model: "demo/m1", mode: "workspace-write" }, () => NOW - 168 * HOUR + 60_000)
+  project.createSession({ sessionId: "session-over", title: "just over the boundary", model: "demo/m1", mode: "workspace-write" }, () => NOW - 168 * HOUR - 60_000)
+  project.createSession({ sessionId: "session-old-latest", title: "ancient but latest", model: "demo/m1", mode: "workspace-write" }, () => NOW - 1000 * HOUR)
   return project
 }
 

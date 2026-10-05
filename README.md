@@ -127,20 +127,69 @@ route is not detected, list it yourself with the `dshProviders` field in your co
 
 ## What the adviser may do
 
-The adviser runs as you, inside the project directory pi was started in, with dsh's default
-`workspace-write` permissions: it can read and change files in that directory, and writes elsewhere
-are refused. It is a real agent with a shell — point it at a task, not at a production box. dsh's own
-`DSH_PERMISSION_MODE` (`read-only`, `workspace-write`, `danger-full-access`) changes this if you
-want a read-only second opinion.
+The adviser is a **trusted component, not a sandboxed one**. It runs as you, inside the project
+directory pi was started in, with dsh's `workspace-write` permissions. Concretely:
+
+- **Reads are unrestricted.** dsh's file sandbox fences writes, not reads: the adviser can read any
+  file this process can read, including files outside the project, your other projects, and
+  `~/.pi/agent/`. There is no knob in dsh that confines reads, so treat everything reachable from
+  your account as visible to it. It also has a shell and network access, so confining reads without
+  confining network would be theatre.
+- **Writes are confined** to the project directory and the platform temporary directory. Anything
+  else is refused, and because an unattended run has nobody to ask, the refusal is immediate rather
+  than a prompt.
+- **It is a real agent**, not a reviewer: it runs commands, spawns its own subagents, and fetches
+  from the network unless you disable those.
+
+`permissionMode` (`read-only`, `workspace-write`, `danger-full-access`) sets the mode for **new**
+sessions. Once a session has a mode, that is the mode it keeps: dsh records it in the session's own
+log — at creation, or at the first later run that adopts the session — and from then on resolves the
+session's permissions from that record rather than from any environment variable. It cannot be
+changed afterwards. pi-dsh records the mode on the session, re-supplies it on every follow-up, and
+**refuses a follow-up that asks for a different mode** rather than quietly ignoring it. Start a new
+session instead. `/dsh-status` shows the mode new sessions get and the modes existing sessions hold.
+
+The `dsh_advise` tool is capped at `workspace-write`: a model cannot widen its own permissions to
+`danger-full-access`, though you can set that mode yourself for `/dsh`.
+
+Every run reports which project files it changed, by comparing the tree before and after the run.
+Writes outside the project — `/tmp`, for instance — do not appear in that list.
 
 Each run is bounded by `timeoutMs` (15 minutes by default) and can be cancelled. Nothing pi-dsh does
 touches Pi's own conversation history.
 
+### What the adviser inherits
+
+dsh runs as a child process, so it would otherwise inherit every credential in the shell that started
+pi. pi-dsh does not do that: the child gets an allowlist — the provider keys your configuration
+names, everything under `DSH_`/`PI_DSH_`, and the usual `PATH`, `HOME`, and locale variables. Name
+anything else the adviser legitimately needs in `envAllowlist`:
+
+```json
+"envAllowlist": ["OPENCODE_API_KEY"]
+```
+
+`/dsh-doctor` lists the credential-like variables being withheld, and flags a plugin route whose key
+is missing from `envAllowlist` — that route would fail to authenticate.
+
+### Turning capabilities off
+
+`disabledTools` names dsh profile rows to disable for the adviser, passed on every run as a launcher
+overlay:
+
+```json
+"disabledTools": ["tool-web", "tool-subagent"]
+```
+
+Tool availability is a profile-row property rather than a session permission, so unlike the mode this
+also applies to sessions that already exist. `tool-web` is the one worth considering: without it the
+adviser can still read your files but cannot fetch a URL to send them to.
+
 ## If something is wrong
 
 Run `/dsh-doctor` first: it checks your configuration, whether dsh is reachable and by which route,
-whether the dsh profile was created, and whether every provider key is actually set in the
-environment.
+whether the dsh profile was created, the permission mode new sessions would get, which credentials
+are withheld from the adviser, and whether every provider key is actually set in the environment.
 
 | Symptom | Cause and fix |
 |---|---|
@@ -148,9 +197,12 @@ environment.
 | `I created your configuration at …` | The first run made `config.json` from the template; add a provider and a model |
 | `no usable provider is configured` | `providers` is empty or missing `apiKeyEnv` / `api` / `baseURL` / `models` |
 | `your configuration file is not valid JSON` | A trailing comma or a missing quote; the file is plain JSON with no comments |
+| `permissionMode must be one of …` | It is `readonly`, not `read-only`; a bad mode is an error rather than a silent downgrade |
+| A plugin route fails with an auth error | Its key is not in `envAllowlist`, so the adviser cannot see it; `/dsh-doctor` names it |
+| `dsh pins a session's permissions for life` | That session was created in another mode; start a new one instead of following up |
 | Run fails with a provider auth error | The key is not exported in the shell that started pi; `/dsh-doctor` names the variable |
 | `there is no session #7 in this project` | That index was deleted or pruned; `/dsh-sessions` lists what exists |
-| The adviser cannot write outside the project | Expected: `workspace-write` covers the project directory only |
+| The adviser cannot write outside the project | Expected: `workspace-write` covers the project directory plus the temp directory |
 
 ## For agents
 

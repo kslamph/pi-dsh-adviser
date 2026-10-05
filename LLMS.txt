@@ -10,11 +10,14 @@
 
 - Registers commands: `/dsh`, `/dsh-follow`, `/dsh-sessions`, `/dsh-delete`, `/dsh-status`,
   `/dsh-model`, `/dsh-doctor`.
-- Registers one model-callable tool, `dsh_advise({ task, followUp?, sessionIndex?, timeoutMs? })`.
-- Runs `dsh` as a child process per turn. pi-dsh owns only the provider route and the model; dsh owns
-  the loop, tools, session log, and permissions.
+- Registers one model-callable tool,
+  `dsh_advise({ task, followUp?, sessionIndex?, timeoutMs?, mode? })`, where `mode` is `read-only` or
+  `workspace-write`.
+- Runs `dsh` as a child process per turn. pi-dsh owns the provider route, the model, and the
+  permission mode; dsh owns the loop, tools, session log, and everything else. The child receives an
+  allowlisted environment rather than pi's own.
 - Stores per-project adviser sessions under `~/.pi/agent/pi-dsh/projects/`, and writes the dsh
-  profile's provider and model rows into the dsh home.
+  profile's provider, model, and permission rows into the dsh home.
 
 ## 2. Check the environment first
 
@@ -23,16 +26,19 @@ Ask the user to run these, in this order, and read the output before changing an
 1. `pi list` — is the extension installed at all?
 2. `/dsh-doctor` — the single authoritative check. It reports: configuration loaded (or the exact
    reason it is not), dsh reachable and by which route, dsh profile created and its patch path,
-   every configured provider key present in the environment, and the plugin routes it found.
+   every configured provider key present in the environment, the plugin routes it found, the
+   permission mode new sessions would get, and which credential-like variables are withheld from
+   the adviser.
 3. `/dsh-status` — project path, session count, effective model and where that model came from
-   (config file or `PI_DSH_DEFAULT_MODEL`), the dsh profile, and the resolved dsh route.
+   (config file or `PI_DSH_DEFAULT_MODEL`), the mode for new sessions and the modes existing
+   sessions are pinned to, disabled rows, the dsh profile, and the resolved dsh route.
 4. `/dsh <reply with OK, do not use tools>` — a live run. Only do this if the user wants a real
    check; it costs a model call.
 
-Never edit `~/.dsh/profiles/<profile>/cordis.patch.yml`. pi-dsh rewrites the `llm-pi-ai` and
-`agent-default-model` rows from the user's config on every run; hand-written rows in that file are
-preserved, but those two are not yours to change. Configure providers in the user's config file
-instead.
+Never edit `~/.dsh/profiles/<profile>/cordis.patch.yml`. pi-dsh rewrites the `llm-pi-ai`,
+`agent-default-model`, and `permission` rows from the user's config on every run; hand-written rows
+in that file are preserved, but those three are not yours to change. Configure providers and
+`permissionMode` in the user's config file instead.
 
 ## 3. Dependencies
 
@@ -82,6 +88,9 @@ Provider and model tables are never read from the environment.
 | `maxResultChars` | no | `20000` | How much of an answer reaches pi; the full text is saved to a file |
 | `pruneAfterHours` | no | `168` | Inactivity hours before a session is pruned; `0` disables |
 | `purgeDsshSessions` | no | `false` | Also delete dsh's own session copy when a session is deleted or pruned |
+| `permissionMode` | no | `workspace-write` | File permissions for **new** sessions: `read-only`, `workspace-write`, or `danger-full-access`. Once a session has a mode, dsh records it in the session log and resolves that session's permissions from the record rather than from the environment, so it cannot be changed afterwards; pi-dsh refuses a follow-up that asks for a different mode. A bad value is an error, not a silent downgrade. `dsh_advise` is capped at `workspace-write`. |
+| `disabledTools` | no | `[]` | dsh profile rows to disable for the adviser, e.g. `["tool-web", "tool-subagent"]`. Applied as a launcher overlay on every run, so unlike `permissionMode` it also affects existing sessions. |
+| `envAllowlist` | no | `[]` | Extra environment variable names to hand the adviser. The child gets an allowlist (the configured `apiKeyEnv` values, `DSH_*`, `PI_DSH_*`, `PATH`, `HOME`, locale) rather than pi's whole environment, so a plugin route's key must be named here. `/dsh-doctor` flags one that is missing. |
 | `dshProviders` | no | `[]` | Routes that dsh plugins provide, when automatic detection cannot find them |
 
 ### Provider route shape
@@ -161,6 +170,9 @@ If detection fails (routes registered at run time, or dsh changed its schema), a
 | `your configuration file is not valid JSON` | Trailing comma, comment, or unquoted key | Rewrite as strict JSON; pi-dsh will not guess |
 | `your configuration file must contain a JSON object` | The file contains an array or a scalar | Wrap it in one object |
 | `… needs MY_KEY in your environment — it is not set` | The key is unset or empty | Export it in the shell that starts pi |
+| `… needs X, which is not in envAllowlist` | A plugin route's key, which the scrubbed child environment does not carry | Add the variable name to `envAllowlist` |
+| `permissionMode must be one of read-only, workspace-write, danger-full-access` | A typo such as `readonly` | Write the mode exactly; pi-dsh refuses rather than guessing a safer one |
+| `dsh pins a session's permissions for life` | A follow-up asked for a different mode than the session was created with | Start a new session; a session's mode is fixed at creation |
 | `there is no session #7 in this project` | Deleted, or pruned after `pruneAfterHours` | `/dsh-sessions`; start a new one with `/dsh` |
 | `the dsh turn failed: …` | dsh itself failed; the text is dsh's own | Read the message; run `/dsh-status` to confirm route and model |
 | `dsh exited with code … before reporting an outcome` | dsh died or the profile failed to boot | `/dsh-doctor`; check `dshProfile` is not a directory that already exists under another name |
@@ -174,4 +186,9 @@ If detection fails (routes registered at run time, or dsh changed its schema), a
 - Read `/dsh-doctor` output instead of guessing. Quote its exact field or variable name back to the
   user rather than paraphrasing.
 - Do not lower `pruneAfterHours` without saying so: it deletes session history the user may want.
+- Treat the adviser as trusted code that runs with the user's own access. It can read any file the
+  user can. Never point it at credentials, production hosts, or another person's data on the theory
+  that it is only "reviewing".
+- Never suggest `danger-full-access` to make a problem go away; it is the user's decision, made on
+  purpose, and `dsh_advise` is capped below it anyway.
 - After any configuration change, confirm with `/dsh-status`, not with a full model run.

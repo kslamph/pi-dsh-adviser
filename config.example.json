@@ -6,5 +6,8 @@
   "timeoutMs": 900000,
   "maxResultChars": 20000,
   "pruneAfterHours": 168,
-  "purgeDsshSessions": false
+  "purgeDsshSessions": false,
+  "permissionMode": "workspace-write",
+  "disabledTools": [],
+  "envAllowlist": []
 }

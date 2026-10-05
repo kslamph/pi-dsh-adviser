@@ -3,7 +3,7 @@ import assert from "node:assert/strict"
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
-import { openProject, slugFor, dshProjectSlug } from "../sessions.ts"
+import { modeOf, openProject, slugFor, dshProjectSlug } from "../sessions.ts"
 
 function setup(): { projectsDir: string; dshHome: string; cwd: string } {
   const home = mkdtempSync(join(tmpdir(), "pi-dsh-store-"))
@@ -46,12 +46,12 @@ test("dsh's own session directory name is reproduced exactly, so purge can find 
 test("indices start at 1, increase, and are never reused after a delete", () => {
   const { projectsDir, cwd } = setup()
   const project = open(projectsDir, cwd)
-  const first = project.createSession({ sessionId: "session-1", title: "auth-race-review", model: "demo/m1" })
-  const second = project.createSession({ sessionId: "session-2", title: "fix-parser", model: "demo/m1" })
+  const first = project.createSession({ sessionId: "session-1", title: "auth-race-review", model: "demo/m1", mode: "workspace-write" })
+  const second = project.createSession({ sessionId: "session-2", title: "fix-parser", model: "demo/m1", mode: "workspace-write" })
   assert.equal(first.index, 1)
   assert.equal(second.index, 2)
   project.remove(1)
-  const third = project.createSession({ sessionId: "session-3", title: "later", model: "demo/m1" })
+  const third = project.createSession({ sessionId: "session-3", title: "later", model: "demo/m1", mode: "workspace-write" })
   assert.equal(third.index, 3, "nextIndex never rewinds")
   assert.equal(project.get(2)?.index, 2, "existing indices are untouched")
   assert.equal(project.get(1), undefined)
@@ -60,8 +60,8 @@ test("indices start at 1, increase, and are never reused after a delete", () => 
 test("the latest session is the newest surviving one after a delete", () => {
   const { projectsDir, cwd } = setup()
   const project = open(projectsDir, cwd)
-  project.createSession({ sessionId: "session-1", title: "one", model: "demo/m1" })
-  project.createSession({ sessionId: "session-2", title: "two", model: "demo/m1" })
+  project.createSession({ sessionId: "session-1", title: "one", model: "demo/m1", mode: "workspace-write" })
+  project.createSession({ sessionId: "session-2", title: "two", model: "demo/m1", mode: "workspace-write" })
   assert.equal(project.latest()?.index, 2)
   project.remove(2)
   assert.equal(project.latest()?.index, 1)
@@ -70,8 +70,8 @@ test("the latest session is the newest surviving one after a delete", () => {
 test("deleting a session removes its artifacts and its run-log lines only", () => {
   const { projectsDir, cwd } = setup()
   const project = open(projectsDir, cwd)
-  project.createSession({ sessionId: "session-1", title: "one", model: "demo/m1" })
-  project.createSession({ sessionId: "session-2", title: "two", model: "demo/m1" })
+  project.createSession({ sessionId: "session-1", title: "one", model: "demo/m1", mode: "workspace-write" })
+  project.createSession({ sessionId: "session-2", title: "two", model: "demo/m1", mode: "workspace-write" })
   const keep = project.artifactPath(2, "run-a")
   const drop = project.artifactPath(1, "run-b")
   project.writeArtifact(1, "run-b", "answer one")
@@ -90,8 +90,8 @@ test("deleting a session removes its artifacts and its run-log lines only", () =
 test("purge removes exactly the target session's dsh directory, never a sibling or the slug dir", () => {
   const { projectsDir, dshHome, cwd } = setup()
   const project = open(projectsDir, cwd)
-  project.createSession({ sessionId: "session-aaa", title: "one", model: "demo/m1" })
-  project.createSession({ sessionId: "session-bbb", title: "two", model: "demo/m1" })
+  project.createSession({ sessionId: "session-aaa", title: "one", model: "demo/m1", mode: "workspace-write" })
+  project.createSession({ sessionId: "session-bbb", title: "two", model: "demo/m1", mode: "workspace-write" })
   const dir = seedDshSession(dshHome, cwd, ["session-aaa", "session-bbb"])
 
   project.remove(1, { purgeDsshSession: true })
@@ -104,7 +104,7 @@ test("purge removes exactly the target session's dsh directory, never a sibling 
 test("a session id that escapes the project directory is refused and removes nothing", () => {
   const { projectsDir, dshHome, cwd } = setup()
   const project = open(projectsDir, cwd)
-  project.createSession({ sessionId: "../../etc", title: "evil", model: "demo/m1" })
+  project.createSession({ sessionId: "../../etc", title: "evil", model: "demo/m1", mode: "workspace-write" })
   const dir = seedDshSession(dshHome, cwd, [])
   assert.throws(() => project.remove(1, { purgeDsshSession: true }), /session id/i)
   assert.ok(existsSync(dir))
@@ -112,14 +112,14 @@ test("a session id that escapes the project directory is refused and removes not
 
 test("reopening a store from a different path is reported instead of silently used", () => {
   const { projectsDir, cwd } = setup()
-  open(projectsDir, cwd).createSession({ sessionId: "session-1", title: "one", model: "demo/m1" })
+  open(projectsDir, cwd).createSession({ sessionId: "session-1", title: "one", model: "demo/m1", mode: "workspace-write" })
   const elsewhere = join(cwd, "..", "other")
   mkdirSync(elsewhere, { recursive: true })
   // A different project gets a different slug, so no store is shared at all.
   assert.notEqual(slugFor(cwd), slugFor(elsewhere))
   assert.throws(() => {
     const project = open(projectsDir, cwd)
-    project.createSession({ sessionId: "session-2", title: "two", model: "demo/m1" })
+    project.createSession({ sessionId: "session-2", title: "two", model: "demo/m1", mode: "workspace-write" })
     const tampered = join(projectsDir, slugFor(cwd), "sessions.json")
     writeFileSync(tampered, JSON.stringify({ projectPath: "/somewhere/else", nextIndex: 9, sessions: [] }))
     project.list()
@@ -131,7 +131,7 @@ test("concurrent session creation yields distinct indices and valid JSON", async
   const project = open(projectsDir, cwd)
   await Promise.all(
     Array.from({ length: 8 }, (_unused, i) =>
-      Promise.resolve().then(() => project.createSession({ sessionId: `session-${i}`, title: `t${i}`, model: "demo/m1" })),
+      Promise.resolve().then(() => project.createSession({ sessionId: `session-${i}`, title: `t${i}`, model: "demo/m1", mode: "workspace-write" })),
     ),
   )
   const indices = project.list().map((session) => session.index).sort((a, b) => a - b)
@@ -144,11 +144,32 @@ test("concurrent session creation yields distinct indices and valid JSON", async
 test("touch records use without creating a session", () => {
   const { projectsDir, cwd } = setup()
   const project = open(projectsDir, cwd)
-  project.createSession({ sessionId: "session-1", title: "one", model: "demo/m1" })
+  project.createSession({ sessionId: "session-1", title: "one", model: "demo/m1", mode: "workspace-write" })
   const before = project.get(1)?.lastUsedAt
   project.touch(1, () => 1_800_000_000_000)
   assert.equal(project.get(1)?.lastUsedAt, new Date(1_800_000_000_000).toISOString())
   assert.notEqual(project.get(1)?.lastUsedAt, before)
   assert.equal(project.list().length, 1)
   assert.ok(!existsSync(join(projectsDir, slugFor(cwd), "runs")), "no runs directory until an artifact is written")
+})
+
+test("a session records the mode it was created under", () => {
+  const s = setup()
+  const project = open(s.projectsDir, s.cwd)
+  const record = project.createSession({ sessionId: "session-a", title: "t", model: "demo/demo-1", mode: "read-only" })
+  assert.equal(record.mode, "read-only")
+  assert.equal(modeOf(project.get(1)!), "read-only", "and it survives a reopen")
+})
+
+test("a store written before modes were tracked reads as workspace-write, not as an error", () => {
+  const s = setup()
+  const project = open(s.projectsDir, s.cwd)
+  project.createSession({ sessionId: "session-a", title: "t", model: "demo/demo-1", mode: "workspace-write" })
+  // Every session predating this field was created under dsh's workspace-write default, so that
+  // is what a missing value means: refusing to continue would strand real history.
+  const path = join(s.projectsDir, project.slug, "sessions.json")
+  const store = JSON.parse(readFileSync(path, "utf8")) as { sessions: Record<string, unknown>[] }
+  delete store.sessions[0]!.mode
+  writeFileSync(path, JSON.stringify(store, null, 2))
+  assert.equal(modeOf(open(s.projectsDir, s.cwd).get(1)!), "workspace-write")
 })

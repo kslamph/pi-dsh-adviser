@@ -9,18 +9,20 @@
  * @module handlers
  */
 
-import { ensureProfile, setModel } from "./config.ts"
-import type { DshConfig } from "./config.ts"
+import { ensureCapabilityPatch, ensureProfile, setModel } from "./config.ts"
+import type { DshConfig, PermissionMode } from "./config.ts"
+import { MODEL_RUN_MAX_MODE, PERMISSION_MODES } from "./config.ts"
 import { dshCommandFor } from "./resolve.ts"
 import type { DshCommand } from "./resolve.ts"
-import { run } from "./runner.ts"
+import { adviserEnv, run } from "./runner.ts"
 import type { RunResult } from "./runner.ts"
-import { openProject } from "./sessions.ts"
+import { modeOf, openProject } from "./sessions.ts"
 import type { Project, SessionRecord } from "./sessions.ts"
 import { pruneExpired } from "./prune.ts"
 import { dshRoutesFor } from "./dshRoutes.ts"
 import type { DshRoute, DiscoveryResult } from "./dshRoutes.ts"
 import { saveModel } from "./config.ts"
+import { changedSince, describeChanges, snapshotWorkspace } from "./workspace.ts"
 
 /** Everything the commands need from the outside world. */
 export interface HandlerDeps {
@@ -42,6 +44,8 @@ export interface HandlerDeps {
   routes: (config: DshConfig) => DiscoveryResult
   /** Clock, injected so tests are exact. */
   now: () => number
+  /** The pi-side environment a run inherits; defaults to this process's. */
+  env?: () => NodeJS.ProcessEnv
 }
 
 /** What a command may show the user. */
@@ -67,11 +71,17 @@ export interface RunDetails {
   index: number
   sessionId: string
   model: string
+  /** File-permission mode the session holds; supplied on every run, since that is what dsh records. */
+  mode: PermissionMode
   steps: number
   durationMs: number
   outcome: string
   artifactPath: string
   truncated: boolean
+  /** Project-relative files the run created, changed, or removed. */
+  filesChanged: string[]
+  /** False when the tree walk was partial, so `filesChanged` may be incomplete. */
+  changeScanComplete: boolean
 }
 
 /** How one invocation reaches dsh. */
@@ -84,6 +94,8 @@ export interface AdviserRun {
   index?: number
   /** Wall-clock override. */
   timeoutMs?: number
+  /** File-permission mode this run runs under; it becomes the session's recorded mode. */
+  mode: PermissionMode
   /** Cancellation, used by the tool. */
   signal?: AbortSignal
   /** Progress callback, used by the tool. */
@@ -124,6 +136,51 @@ export function realDeps(): HandlerDeps {
 }
 
 /**
+ * Decide the file-permission mode one run uses.
+ *
+ * dsh records a session's mode in its own log — at creation, or at the first boot that lists
+ * the session — and from then on `SandboxPolicyService.resolve()` prefers that record over the
+ * deployment default. Verified against dsh 0.2.0-rc.2: a session created `read-only` whose
+ * follow-up process exported `workspace-write` had the *follow-up's* value written into the log
+ * and was writable from then on, and a later `read-only` follow-up could not take it back.
+ *
+ * So the mode has to be supplied correctly by *every* run, not just the creating one: pi-dsh
+ * records it on the session and re-supplies it on each follow-up, and refuses a follow-up that
+ * asks for a different one. A model-initiated run is additionally capped at `workspace-write`:
+ * widening to `danger-full-access` is a decision for a person at a command line, not something a
+ * tool call may make on the user's behalf.
+ *
+ * `DSH_PERMISSION_MODE` is still honoured for a command a person typed, so the documented escape
+ * hatch keeps working, but never for the tool.
+ *
+ * @param config - the loaded configuration
+ * @param requested - an explicit mode, from the tool's `mode` parameter
+ * @param source - who asked for this run
+ * @returns the mode to run under and a note when that is not simply the request
+ */
+export function resolveMode(
+  config: DshConfig,
+  requested: PermissionMode | undefined,
+  source: "model" | "user",
+): { mode: PermissionMode; note?: string } {
+  const cap = (wanted: PermissionMode): { mode: PermissionMode; note?: string } =>
+    wanted === "danger-full-access"
+      ? {
+          mode: MODEL_RUN_MAX_MODE,
+          note: "danger-full-access is available to /dsh but a model-initiated run is capped at workspace-write",
+        }
+      : { mode: wanted }
+  if (requested !== undefined) return source === "model" ? cap(requested) : { mode: requested }
+  if (source === "user") {
+    const fromEnv = process.env.DSH_PERMISSION_MODE
+    if (fromEnv !== undefined && (PERMISSION_MODES as readonly string[]).includes(fromEnv)) {
+      return { mode: fromEnv as PermissionMode, note: "mode from DSH_PERMISSION_MODE" }
+    }
+  }
+  return source === "model" ? cap(config.permissionMode) : { mode: config.permissionMode }
+}
+
+/**
  * Run one adviser turn and record it against a project session.
  *
  * Both the commands and the model-callable tool go through here, so a run is created, capped,
@@ -140,6 +197,13 @@ export async function runAdviser(deps: HandlerDeps, config: DshConfig, project: 
   const command = deps.dshCommand(config)
   deps.ensureProfile(config, command)
   const model = `${config.model.provider}/${config.model.id}`
+  const patchPaths = [ensureCapabilityPatch(config)].filter((path): path is string => path !== undefined)
+  const providerKeys = Object.values(config.providers).map((provider) => provider.apiKeyEnv)
+  // The mode is set explicitly rather than inherited: an ambient DSH_PERMISSION_MODE in the
+  // user's shell must not silently redefine what a tool call is allowed to do.
+  const env = adviserEnv([...providerKeys, ...config.envAllowlist], deps.env?.() ?? process.env)
+  env.DSH_PERMISSION_MODE = request.mode
+  const before = snapshotWorkspace(project.path, deps.now)
   const result = await deps.run({
     profile: config.dshProfile,
     dshCommand: command,
@@ -147,40 +211,48 @@ export async function runAdviser(deps: HandlerDeps, config: DshConfig, project: 
     task: request.task,
     ...(request.sessionId === undefined ? {} : { sessionId: request.sessionId }),
     timeoutMs: request.timeoutMs ?? config.timeoutMs,
+    ...(patchPaths.length === 0 ? {} : { patchPaths }),
+    env,
     ...(request.signal === undefined ? {} : { signal: request.signal }),
     onEvent: (event) => {
       if (event.type === "status" && event.phase === "step_end") request.onProgress?.(`step ${Number(event.step ?? 0) + 1}`)
       if (event.type === "status" && event.phase === "turn_start") request.onProgress?.("thinking")
     },
   })
+  const changes = changedSince(before, snapshotWorkspace(project.path, deps.now), project.path)
   const sessionId = result.sessionId ?? request.sessionId
   if (sessionId === undefined) {
     throw new Error("pi-dsh: dsh finished without reporting a session, so I cannot continue this conversation later")
   }
 
-  const truncated = result.text.length > config.maxResultChars
-  const text = truncated
-    ? `${result.text.slice(0, config.maxResultChars)}\n\n[truncated — full answer at the artifact path]`
-    : result.text
   const runId = `${deps.now()}`
-
   const record = request.index === undefined
-    ? project.createSession({ sessionId, title: titleFrom(request.task), model }, deps.now)
+    ? project.createSession({ sessionId, title: titleFrom(request.task), model, mode: request.mode }, deps.now)
     : (project.touch(request.index, deps.now), project.get(request.index) as SessionRecord)
   // Written after the index exists, so an artifact is always named after the session it belongs to
   // and deleting that session takes its artifacts with it.
   const artifactPath = project.writeArtifact(record.index, runId, result.text)
+
+  // Capped last, so the truncation notice can name the file the rest of the answer is in.
+  const truncated = result.text.length > config.maxResultChars
+  const text = [
+    truncated ? result.text.slice(0, config.maxResultChars) : result.text,
+    ...(truncated ? [`[truncated at ${config.maxResultChars} characters — the full answer is at ${artifactPath}]`] : []),
+    ...[describeChanges(changes)].filter((line): line is string => line !== undefined),
+  ].join("\n\n")
 
   project.appendRunLog({
     at: new Date(deps.now()).toISOString(),
     project: project.path,
     index: record.index,
     model,
+    mode: request.mode,
     resumed: request.index !== undefined,
     taskChars: request.task.length,
     steps: result.steps,
     durationMs: result.durationMs,
     outcome: result.outcome,
+    filesChanged: changes.files.length,
     ...result.usage,
   })
 
@@ -193,11 +265,14 @@ export async function runAdviser(deps: HandlerDeps, config: DshConfig, project: 
       index: record.index,
       sessionId,
       model,
+      mode: modeOf(record),
       steps: result.steps,
       durationMs: result.durationMs,
       outcome: result.outcome,
       artifactPath,
       truncated,
+      filesChanged: changes.files,
+      changeScanComplete: changes.complete,
     },
   }
 }
@@ -323,9 +398,14 @@ export function createHandlers(deps: HandlerDeps): Record<string, Handler> {
       const context = projectFor(ctx)
       if (context === undefined) return
       prune(context.config, context.project)
-      await advise(ctx, context.config, context.project, { task }, (record) =>
+      const { mode, note } = resolveMode(context.config, undefined, "user")
+      if (note !== undefined) ctx.notify(`dsh: ${note}`, "warning")
+      if (mode === "danger-full-access") {
+        ctx.notify("dsh: the adviser can read and write anything this process can — it is pointed at a task, not a production box", "warning")
+      }
+      await advise(ctx, context.config, context.project, { task, mode }, (record) =>
         `session #${record.index} created — continue with /dsh-follow #${record.index} <text>`
-        + ` · ${record.model}`,
+        + ` · ${record.model} · ${record.mode}`,
       )
     },
 
@@ -353,11 +433,26 @@ export function createHandlers(deps: HandlerDeps): Record<string, Handler> {
         return
       }
       prune(context.config, context.project, target.index)
+      const { mode, note } = resolveMode(context.config, undefined, "user")
+      if (note !== undefined) ctx.notify(`dsh: ${note}`, "warning")
+      // dsh records a session's mode once and cannot change it afterwards, so a resumed
+      // session must be run under the mode it already has. Saying so beats quietly running
+      // wider or narrower than the person asked for.
+      const pinned = modeOf(target)
+      if (pinned !== mode) {
+        ctx.notify(
+          `dsh: session #${target.index} was created ${pinned} and dsh pins a session's permissions for life,`
+          + ` so it cannot continue as ${mode}. Start a new one with /dsh ${parsed.text}`,
+          "warning",
+        )
+        return
+      }
       await advise(ctx, context.config, context.project, {
         task: parsed.text,
         sessionId: target.sessionId,
         index: target.index,
-      }, (record) => `continued session #${record.index} · ${record.model}`)
+        mode: pinned,
+      }, (record) => `continued session #${record.index} · ${record.model} · ${record.mode}`)
     },
 
     async "dsh-sessions"(args, ctx) {
@@ -373,7 +468,7 @@ export function createHandlers(deps: HandlerDeps): Record<string, Handler> {
       for (const session of sessions) {
         const age = relativeAge(Date.parse(session.lastUsedAt), deps.now())
         const marker = session.index === latest?.index ? "  ← latest" : ""
-        lines.push(`  #${session.index} ${session.title} · ${session.runs} runs · ${age}${marker}`)
+        lines.push(`  #${session.index} ${session.title} · ${session.runs} runs · ${age} · ${modeOf(session)}${marker}`)
       }
       lines.push(`continue one with /dsh-follow #<n> <text>; remove one with /dsh-delete #<n>`)
       ctx.notify(lines.join("\n"), "info")
@@ -424,6 +519,7 @@ export function createHandlers(deps: HandlerDeps): Record<string, Handler> {
       const sessions = project.list()
       const latest = sessions[sessions.length - 1]
       const routes = routesOf(config)
+      const resolved = resolveMode(config, undefined, "user")
       const routeLine = routes.error !== undefined
         ? "routes: could not check the dsh plugins"
         : `routes:   ${routes.plugin.length + routes.declared.length} from dsh plugins`
@@ -431,9 +527,13 @@ export function createHandlers(deps: HandlerDeps): Record<string, Handler> {
         `project:   ${project.path}`,
         `sessions:  ${sessions.length}${latest === undefined ? "" : ` · latest #${latest.index} "${latest.title}"`}`,
         `model:     ${config.model.provider}/${config.model.id} (${config.modelSource})`,
+        `mode:      ${resolved.mode} for new sessions${resolved.note === undefined ? "" : ` (${resolved.note})`}`,
+        ...(sessions.length === 0 ? [] : [`pinned:    ${[...new Set(sessions.map((session) => `${modeOf(session)}`))].join(", ")} across existing sessions`]),
         `dsh:       ${config.dshProfile} (${patch})`,
         `dsh route: ${route}`,
         routeLine,
+        ...(config.disabledTools.length === 0 ? [] : [`disabled:  ${config.disabledTools.join(", ")}`]),
+        `env:       ${Object.keys(adviserEnv([...Object.values(config.providers).map((provider) => provider.apiKeyEnv), ...config.envAllowlist])).length} variables forwarded to dsh`,
         `timeout:   ${Math.round(config.timeoutMs / 1000)}s`,
         `prune:     ${config.pruneAfterHours === 0 ? "off" : `after ${config.pruneAfterHours}h idle`}`,
       ]
@@ -562,7 +662,31 @@ export function createHandlers(deps: HandlerDeps): Record<string, Handler> {
       } catch (error) {
         lines.push(`  fail session store: ${error instanceof Error ? error.message : String(error)}`)
       }
-      lines.push(`  note adviser runs in ${ctx.cwd} with dsh's workspace-write permissions; DSH_PERMISSION_MODE changes that`)
+      lines.push(`  note adviser runs in ${ctx.cwd}; mode for new sessions is ${resolveMode(config, undefined, "user").mode}`
+        + ` and dsh pins a session's mode at creation, so it cannot change mid-conversation`)
+      if (resolveMode(config, undefined, "user").mode === "danger-full-access") {
+        lines.push("  warn danger-full-access is on: the adviser can read and write anything this process can")
+      }
+      const forwarded = new Set([
+        ...Object.values(config.providers).map((provider) => provider.apiKeyEnv),
+        ...config.envAllowlist,
+      ])
+      const hidden = Object.keys(process.env).filter(
+        (key) => key.includes("KEY") || key.includes("TOKEN") || key.includes("SECRET"),
+      ).filter((key) => !forwarded.has(key))
+      if (hidden.length > 0) {
+        lines.push(`  note ${hidden.length} credential-like variable(s) in your environment are not forwarded to dsh,`
+          + ` including ${hidden.slice(0, 3).join(", ")}${hidden.length > 3 ? ", …" : ""}.`
+          + ` Add any the adviser legitimately needs to envAllowlist.`)
+      }
+      for (const route of routes.plugin) {
+        if (route.apiKeyEnv !== undefined && !forwarded.has(route.apiKeyEnv)) {
+          lines.push(`  fail route ${route.route} needs ${route.apiKeyEnv}, which is not in envAllowlist, so the adviser cannot authenticate with it`)
+        }
+      }
+      if (config.disabledTools.length > 0) {
+        lines.push(`  ok   disabled for the adviser: ${config.disabledTools.join(", ")}`)
+      }
       ctx.notify(lines.join("\n"), "info")
     },
   }

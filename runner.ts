@@ -69,6 +69,49 @@ export interface RunOptions {
   onEvent?: (event: DshEvent) => void
   /** Cancels the run. */
   signal?: AbortSignal
+  /** Launcher overlays passed as `--patch`, each overriding profile rows for this run. */
+  patchPaths?: string[]
+  /** The child's environment; defaults to a scrubbed allowlist of ours. */
+  env?: NodeJS.ProcessEnv
+}
+
+/**
+ * Variables a dsh run needs whatever the configuration says.
+ *
+ * The child is a full agent with a shell and network access, so handing it
+ * everything the user's shell holds would hand it every credential in the
+ * session — including the provider keys this run needs, which are added back
+ * explicitly by {@link adviserEnv} and nothing else.
+ */
+const ENV_NAMES = [
+  "PATH", "HOME", "USERPROFILE", "SHELL", "TMPDIR", "TMP", "TEMP",
+  "LANG", "LANGUAGE", "LC_ALL", "LC_CTYPE", "TZ", "TERM",
+  "NODE_EXTRA_CA_CERTS", "SSL_CERT_FILE", "SSL_CERT_DIR",
+]
+
+/** Variable prefixes kept whole, so dsh's and pi-dsh's own settings survive. */
+const ENV_PREFIXES = ["DSH_", "PI_DSH_", "npm_config_"]
+
+/**
+ * Build the environment a dsh run is allowed to see.
+ *
+ * Allowlist rather than denylist: a new secret in the user's shell is excluded by
+ * default instead of leaking until someone remembers to add it here. Provider keys
+ * are the deliberate exception, passed as `extraKeys`, because dsh reads them from
+ * the environment by name.
+ *
+ * @param extraKeys - variable names the run genuinely needs, such as provider keys
+ * @param base - the environment to filter; defaults to this process's
+ * @returns the filtered environment
+ */
+export function adviserEnv(extraKeys: readonly string[] = [], base: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEnv {
+  const wanted = new Set([...ENV_NAMES, ...extraKeys])
+  const env: NodeJS.ProcessEnv = {}
+  for (const [key, value] of Object.entries(base)) {
+    if (value === undefined) continue
+    if (wanted.has(key) || ENV_PREFIXES.some((prefix) => key.startsWith(prefix))) env[key] = value
+  }
+  return env
 }
 
 /** Raised when a run cannot be started at all. */
@@ -100,7 +143,9 @@ function accumulate(totals: DshUsage, usage: DshStepUsage | undefined): void {
  * @throws {RunError} when dsh cannot be started or exits without an outcome
  */
 export async function run(options: RunOptions): Promise<RunResult> {
-  const args = [...(options.dshCommand?.args ?? []), "--profile", options.profile, "--json"]
+  const args = [...(options.dshCommand?.args ?? [])]
+  for (const patch of options.patchPaths ?? []) args.push("--patch", patch)
+  args.push("--profile", options.profile, "--json")
   if (options.sessionId !== undefined) args.push("--session-id", options.sessionId)
   args.push("--", options.task)
 
@@ -117,7 +162,7 @@ export async function run(options: RunOptions): Promise<RunResult> {
   await new Promise<void>((resolve, reject) => {
     const child = spawnFn(options.dshCommand?.command ?? "dsh", args, {
       cwd: options.cwd,
-      env: process.env,
+      env: options.env ?? adviserEnv(),
       stdio: ["ignore", "pipe", "pipe"],
     })
 

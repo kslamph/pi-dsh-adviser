@@ -33,13 +33,21 @@ function harness(overrides: Partial<HandlerDeps> = {}, confirm = true) {
     maxResultChars: 20000,
     pruneAfterHours: 168,
     purgeDsshSessions: false,
+    permissionMode: "workspace-write",
+    disabledTools: [],
+    envAllowlist: [],
     dshProviders: [] as string[],
     modelSource: "config file" as const,
   }
-  const runs: { task: string; sessionId?: string }[] = []
+  const runs: { task: string; sessionId?: string; env?: NodeJS.ProcessEnv; patchPaths?: string[] }[] = []
   let nextSession = 1
-  const run = (async (options: { task: string; sessionId?: string }): Promise<RunResult> => {
-    runs.push({ task: options.task, ...(options.sessionId === undefined ? {} : { sessionId: options.sessionId }) })
+  const run = (async (options: { task: string; sessionId?: string; env?: NodeJS.ProcessEnv; patchPaths?: string[] }): Promise<RunResult> => {
+    runs.push({
+      task: options.task,
+      ...(options.sessionId === undefined ? {} : { sessionId: options.sessionId }),
+      ...(options.env === undefined ? {} : { env: options.env }),
+      ...(options.patchPaths === undefined ? {} : { patchPaths: options.patchPaths }),
+    })
     const sessionId = options.sessionId ?? `session-gen${nextSession++}`
     return {
       sessionId,
@@ -82,7 +90,7 @@ function harness(overrides: Partial<HandlerDeps> = {}, confirm = true) {
       assert.ok(handler !== undefined, `no such command: ${name}`)
       await handler(args, ctx)
     },
-    messages, entries, runs, ctx, project: () => openProject(cwd, config.projectsDir), home, config,
+    messages, entries, runs, ctx, deps, project: () => openProject(cwd, config.projectsDir), home, config, cwd,
   }
 }
 
@@ -354,4 +362,136 @@ test("switching the model never touches a real user's configuration file", async
   const { userConfigPath } = await import("../config.ts")
   assert.ok(userConfigPath().startsWith(h.home), "the write stayed inside the test home")
   assert.match(readFileSync(userConfigPath(), "utf8"), /zenfree/)
+})
+
+test("the mode reaches dsh as an explicit variable, not as whatever the shell happened to export", async () => {
+  const h = harness()
+  await h.run("dsh", "first")
+  assert.equal(h.runs[0]!.env?.DSH_PERMISSION_MODE, "workspace-write")
+  assert.equal(h.runs[0]!.env?.DEMO_KEY, process.env.DEMO_KEY, "the provider key still travels")
+
+  process.env.DSH_PERMISSION_MODE = "read-only"
+  try {
+    await h.run("dsh", "second")
+    assert.equal(h.runs[1]!.env?.DSH_PERMISSION_MODE, "read-only", "a person's export is honoured")
+  } finally {
+    delete process.env.DSH_PERMISSION_MODE
+  }
+})
+
+test("a session records the mode it was created under, and /dsh-sessions shows it", async () => {
+  const h = harness()
+  await h.run("dsh", "first")
+  h.messages.length = 0
+  await h.run("dsh-sessions", "")
+  assert.match(h.messages[0]!.text, /workspace-write/)
+  assert.equal(h.project().get(1)?.mode, "workspace-write")
+})
+
+test("/dsh-follow refuses to re-permission a session, and says why", async () => {
+  const h = harness()
+  await h.run("dsh", "first")
+  // The session was created workspace-write; only now does the configuration ask for read-only.
+  h.deps.loadConfig = () => ({ ...h.config, permissionMode: "read-only" })
+  const before = h.runs.length
+  await h.run("dsh-follow", "now be writable")
+  assert.equal(h.runs.length, before, "no run happened")
+  assert.match(h.messages.at(-1)!.text, /pins a session's permissions/)
+  assert.match(h.messages.at(-1)!.text, /Start a new one with \/dsh/)
+})
+
+test("the run reports which project files the adviser changed, including a write by its own subagent", async () => {
+  // The fake run mutates the tree the way a real one would, from inside the run rather than
+  // between two runs, which is the only window the before/after comparison covers.
+  const { mkdirSync, writeFileSync } = await import("node:fs")
+  const { join } = await import("node:path")
+  const h = harness({
+    run: (async (options: { cwd: string; task: string }) => {
+      mkdirSync(join(options.cwd, "src"), { recursive: true })
+      writeFileSync(join(options.cwd, "src", "written-by-adviser.md"), "hello")
+      return {
+        sessionId: `session-gen${h.runs.length + 1}`,
+        text: "the answer",
+        steps: 1,
+        usage: { input: 1, output: 1, cacheRead: 0, totalTokens: 2 },
+        outcome: "completed",
+        durationMs: 1,
+        stderr: "",
+      }
+    }) as unknown as HandlerDeps["run"],
+  })
+  await h.run("dsh", "first")
+  assert.deepEqual((h.entries.at(-1)!.details as { filesChanged: string[] }).filesChanged, [join("src", "written-by-adviser.md")])
+  assert.equal((h.entries.at(-1)!.details as { changeScanComplete: boolean }).changeScanComplete, true)
+})
+
+test("a truncated answer names the file the rest of it is in", async () => {
+  const h = harness()
+  h.deps.loadConfig = () => ({ ...h.config, maxResultChars: 5 })
+  await h.run("dsh", "first")
+  const text = h.entries.at(-1)!.details as { artifactPath: string; truncated: boolean }
+  assert.equal(text.truncated, true)
+  assert.equal(text.artifactPath.endsWith(".md"), true)
+})
+
+test("/dsh-status names the mode, the pinned modes, and what is disabled", async () => {
+  const h = harness()
+  h.deps.loadConfig = () => ({ ...h.config, disabledTools: ["tool-web"] })
+  await h.run("dsh", "first")
+  h.messages.length = 0
+  await h.run("dsh-status", "")
+  const text = h.messages[0]!.text
+  assert.match(text, /mode:\s+workspace-write for new sessions/)
+  assert.match(text, /pinned:\s+workspace-write/)
+  assert.match(text, /disabled:\s+tool-web/)
+  assert.match(text, /env:\s+\d+ variables forwarded/)
+})
+
+test("/dsh-doctor reports the mode, and warns when it is danger-full-access", async () => {
+  const safe = harness()
+  await safe.run("dsh-doctor", "")
+  assert.match(safe.messages[0]!.text, /mode for new sessions is workspace-write/)
+  assert.doesNotMatch(safe.messages[0]!.text, /DSH_PERMISSION_MODE changes that/, "the stale note is gone")
+
+  const wide = harness()
+  wide.deps.loadConfig = () => ({ ...wide.config, permissionMode: "danger-full-access" })
+  await wide.run("dsh-doctor", "")
+  assert.match(wide.messages[0]!.text, /danger-full-access/)
+})
+
+test("/dsh-doctor says which credentials it withholds from the adviser, and spares the ones it forwards", async () => {
+  const h = harness()
+  process.env.PI_DSH_TEST_SECRET_TOKEN = "hunter2"
+  try {
+    await h.run("dsh-doctor", "")
+    const note = h.messages[0]!.text.split("\n").find((line) => /credential-like/.test(line)) ?? ""
+    assert.match(note, /not forwarded to dsh/)
+    assert.match(note, /envAllowlist/, "and how to forward one deliberately")
+    assert.doesNotMatch(note, /DEMO_KEY/, "the provider's own key is forwarded, so it is not reported as withheld")
+  } finally {
+    delete process.env.PI_DSH_TEST_SECRET_TOKEN
+  }
+})
+
+test("every run re-supplies the session's own mode, because that is what dsh records", async () => {
+  // Measured against dsh 0.2.0-rc.2: a session created read-only and then continued by a process
+  // exporting workspace-write had *the follow-up's* value written into its log and was writable
+  // from then on. Whoever supplies the mode on each run decides what the session becomes.
+  const h = harness()
+  await h.run("dsh", "first")
+  assert.equal(h.runs[0]!.env?.DSH_PERMISSION_MODE, "workspace-write")
+  await h.run("dsh-follow", "and again")
+  assert.equal(h.runs[1]!.sessionId, "session-gen1")
+  assert.equal(h.runs[1]!.env?.DSH_PERMISSION_MODE, "workspace-write", "the resumed session runs under its own mode")
+
+  h.deps.loadConfig = () => ({ ...h.config, permissionMode: "read-only" })
+  await h.run("dsh", "second")
+  assert.equal(h.runs[2]!.env?.DSH_PERMISSION_MODE, "read-only", "a new session takes the configured mode")
+  assert.equal(h.project().get(2)?.mode, "read-only")
+
+  h.deps.loadConfig = () => ({ ...h.config, permissionMode: "workspace-write" })
+  const before = h.runs.length
+  await h.run("dsh-follow", "#2 widen me")
+  assert.equal(h.runs.length, before, "widening a session is refused, not performed")
+  assert.match(h.messages.at(-1)!.text, /pins a session's permissions/)
 })

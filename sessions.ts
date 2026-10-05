@@ -16,6 +16,7 @@ import { createHash } from "node:crypto"
 import { appendFileSync, existsSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs"
 import { join, resolve } from "node:path"
 import { dshSessionsRoot } from "./config.ts"
+import type { PermissionMode } from "./config.ts"
 
 /** One adviser session, as recorded in the project's store. */
 export interface SessionRecord {
@@ -27,6 +28,8 @@ export interface SessionRecord {
   title: string
   /** Model the session runs on. */
   model: string
+  /** File-permission mode dsh pinned into this session when it was created. */
+  mode: PermissionMode
   /** ISO timestamp of creation. */
   createdAt: string
   /** ISO timestamp of the most recent use; drives pruning. */
@@ -49,7 +52,7 @@ export interface Project {
   /** Directory slug derived from the path. */
   readonly slug: string
   /** Record a new session and return it. */
-  createSession(input: { sessionId: string; title: string; model: string }, now?: () => number): SessionRecord
+  createSession(input: { sessionId: string; title: string; model: string; mode: PermissionMode }, now?: () => number): SessionRecord
   /** One session by index, or undefined. */
   get(index: number): SessionRecord | undefined
   /** The newest surviving session, or undefined. */
@@ -119,6 +122,20 @@ function titleFor(task: string): string {
 }
 
 /**
+ * The permission mode a session record was created under.
+ *
+ * Stores written before pi-dsh tracked the mode have no such field, and every one
+ * of them ran under dsh's `workspace-write` default, so that is what a missing value
+ * means rather than an error.
+ *
+ * @param record - a session record, old or new
+ * @returns the mode the session is pinned to
+ */
+export function modeOf(record: SessionRecord): PermissionMode {
+  return (record as { mode?: PermissionMode }).mode ?? "workspace-write"
+}
+
+/**
  * Open (or create) the session store for a project.
  *
  * @param cwd - the project path sessions belong to
@@ -170,6 +187,7 @@ export function openProject(cwd: string, projectsDir?: string): Project {
         sessionId: input.sessionId,
         title: input.title.length > 0 ? input.title : titleFor(input.sessionId),
         model: input.model,
+        mode: input.mode,
         createdAt: timestamp,
         lastUsedAt: timestamp,
         runs: 1,

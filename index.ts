@@ -101,17 +101,26 @@ export default function piDsh(pi: ExtensionAPI): void {
     description:
       "Delegate a self-contained task to a separate DeepSeek Harness runtime that has its own system prompt,"
       + " toolset, and model. Use it for a second opinion, an isolated deep dive, or work that needs its own"
-      + " workspace discipline. It does not see this conversation: state the task and the constraints it needs."
-      + " Sessions belong to the current project directory. Set followUp to continue a session instead of"
-      + " starting one, and sessionIndex to continue a specific one of this project's sessions.",
+      + " discipline. It does not see this conversation: state the task and the constraints it needs."
+      + " It is a real agent, not a read-only reviewer. It runs in this project directory with a shell: it can"
+      + " create and edit files here, run tests, spawn its own subagents, and fetch from the network, and it may"
+      + " read any file this process can read. Every run reports which project files it changed."
+      + " Pass mode \"read-only\" for an opinion that must not touch the tree; the default \"workspace-write\""
+      + " lets it run tests and leave scratch files. Sessions belong to the project directory and keep the mode"
+      + " they were first run with — dsh records it and will not change it — so a follow-up cannot change mode,"
+      + " and this tool cannot ask for danger-full-access. It cannot ask the user questions either, so the task"
+      + " must be complete.",
     parameters: Type.Object({
       task: Type.String({ description: "The task for the adviser, including any constraints and the files or paths it should read." }),
       followUp: Type.Optional(Type.Boolean({ description: "Continue an adviser session instead of starting a new one." })),
       sessionIndex: Type.Optional(Type.Number({ description: "Which of this project's sessions to continue; defaults to the latest." })),
       timeoutMs: Type.Optional(Type.Number({ description: "Wall-clock limit for this run; defaults to the configured limit." })),
+      mode: Type.Optional(Type.Union([Type.Literal("read-only"), Type.Literal("workspace-write")], {
+        description: "File permissions for this session. \"read-only\" refuses every file change; \"workspace-write\" allows changes inside this project directory and /tmp. Defaults to your configured mode. It cannot change an existing session's mode.",
+      })),
     }),
-    annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true },
-    async execute(_toolCallId, params, signal, onUpdate, _toolContext: ExtensionToolContext) {
+    annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: true },
+    async execute(_toolCallId, params, signal, onUpdate, toolContext: ExtensionToolContext) {
       try {
         const result = await advise(
           {
@@ -119,12 +128,13 @@ export default function piDsh(pi: ExtensionAPI): void {
             ...(params.followUp === undefined ? {} : { followUp: params.followUp }),
             ...(params.sessionIndex === undefined ? {} : { sessionIndex: params.sessionIndex }),
             ...(params.timeoutMs === undefined ? {} : { timeoutMs: params.timeoutMs }),
+            ...(params.mode === undefined ? {} : { mode: params.mode }),
             ...(onUpdate === undefined || signal === undefined ? {} : {
               onProgress: (label: string) => onUpdate({ content: [{ type: "text", text: `dsh: ${label}` }], details: undefined }),
               signal,
             }),
           },
-          process.cwd(),
+          toolContext.cwd,
         )
         return {
           content: [{ type: "text", text: result.text }],
