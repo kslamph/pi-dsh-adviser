@@ -189,7 +189,10 @@ anything else the adviser legitimately needs in `envAllowlist`:
 ```
 
 `/dsh-doctor` lists the credential-like variables being withheld, and flags a plugin route whose key
-is missing from `envAllowlist` — that route would fail to authenticate.
+is missing from `envAllowlist` — that route would fail to authenticate. Read that flag as "you may
+want this", not "something is broken": a plugin route is only reachable once you point `/dsh-model`
+at it, so the flag is inert while the adviser runs on a configured provider. Add the key when you
+intend to use the route; leave it out otherwise, and the key stays out of every child process.
 
 ### Turning capabilities off
 

@@ -473,6 +473,15 @@ test("/dsh-doctor says which credentials it withholds from the adviser, and spar
   }
 })
 
+test("/dsh-doctor names the config file and the caveat when a plugin route's key is withheld", async () => {
+  const h = pluginHarness([{ route: "zenfree", entryId: "llm-zenfree", packageName: "dsh-llm-zenfree", apiKeyEnv: "OPENCODE_API_KEY" }])
+  await h.run("dsh-doctor", "")
+  const fail = h.messages[0]!.text.split("\n").find((line) => /not in envAllowlist/.test(line)) ?? ""
+  assert.match(fail, /route zenfree needs OPENCODE_API_KEY/, "it names the route and the variable")
+  assert.match(fail, /\/dsh-model at zenfree/, "and says when the route becomes reachable, so the flag reads as harmless")
+  assert.match(fail, /"envAllowlist" in .*pi-dsh\/config\.json$/, "and says which file to edit")
+})
+
 test("every run re-supplies the session's own mode, because that is what dsh records", async () => {
   // Measured against dsh 0.2.0-rc.2: a session created read-only and then continued by a process
   // exporting workspace-write had *the follow-up's* value written into its log and was writable

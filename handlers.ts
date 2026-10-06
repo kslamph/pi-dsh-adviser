@@ -9,7 +9,7 @@
  * @module handlers
  */
 
-import { ensureCapabilityPatch, ensureProfile, setModel } from "./config.ts"
+import { ensureCapabilityPatch, ensureProfile, setModel, userConfigPath } from "./config.ts"
 import type { DshConfig, PermissionMode } from "./config.ts"
 import { MODEL_RUN_MAX_MODE, PERMISSION_MODES } from "./config.ts"
 import { dshCommandFor } from "./resolve.ts"
@@ -681,7 +681,12 @@ export function createHandlers(deps: HandlerDeps): Record<string, Handler> {
       }
       for (const route of routes.plugin) {
         if (route.apiKeyEnv !== undefined && !forwarded.has(route.apiKeyEnv)) {
-          lines.push(`  fail route ${route.route} needs ${route.apiKeyEnv}, which is not in envAllowlist, so the adviser cannot authenticate with it`)
+          // The file and the caveat are named here because this line is often the first and only thing a
+        // user reads: a route nobody selects cannot break a run, and the fix lives in a file this
+        // message would otherwise never mention.
+        lines.push(`  fail route ${route.route} needs ${route.apiKeyEnv}, which is not in envAllowlist, so the adviser cannot authenticate with it`
+          + ` — harmless until you point /dsh-model at ${route.route}; to allow it, add "${route.apiKeyEnv}" to "envAllowlist"`
+          + ` in ${userConfigPath()}`)
         }
       }
       if (config.disabledTools.length > 0) {

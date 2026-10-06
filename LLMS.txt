@@ -104,7 +104,7 @@ Provider and model tables are never read from the environment.
 | `purgeDsshSessions` | no | `false` | Also delete dsh's own session copy when a session is deleted or pruned |
 | `permissionMode` | no | `workspace-write` | File permissions for **new** sessions: `read-only`, `workspace-write`, or `danger-full-access`. dsh records a session's mode in its log — at creation, or at the first run that adopts the session — and resolves that session's permissions from the record rather than from the environment, so it cannot be changed afterwards; pi-dsh re-supplies the recorded mode on every follow-up and refuses a follow-up asking for a different one. A bad value is an error, not a silent downgrade. `dsh_advise` is capped at `workspace-write`. Exporting `DSH_PERMISSION_MODE` still overrides this for a `/dsh` command the user typed, never for a tool call. |
 | `disabledTools` | no | `[]` | dsh profile rows to disable for the adviser, e.g. `["tool-web", "tool-subagent"]`. Applied as a launcher overlay on every run, so unlike `permissionMode` it also affects existing sessions. |
-| `envAllowlist` | no | `[]` | Extra environment variable names to hand the adviser. The child gets an allowlist (the configured `apiKeyEnv` values, `DSH_*`, `PI_DSH_*`, `PATH`, `HOME`, locale) rather than pi's whole environment, so a plugin route's key must be named here. `/dsh-doctor` flags one that is missing. |
+| `envAllowlist` | no | `[]` | Extra environment variable names to hand the adviser. The child gets an allowlist (the configured `apiKeyEnv` values, `DSH_*`, `PI_DSH_*`, `PATH`, `HOME`, locale) rather than pi's whole environment, so a plugin route's key must be named here. `/dsh-doctor` flags one that is missing — treat that as "you may want this", not "broken": a plugin route is unreachable until `/dsh-model` is pointed at it, so the flag costs nothing while the adviser runs on a configured provider. |
 | `dshProviders` | no | `[]` | Routes that dsh plugins provide, when automatic detection cannot find them |
 
 ### Provider route shape
@@ -184,7 +184,7 @@ If detection fails (routes registered at run time, or dsh changed its schema), a
 | `your configuration file is not valid JSON` | Trailing comma, comment, or unquoted key | Rewrite as strict JSON; pi-dsh will not guess |
 | `your configuration file must contain a JSON object` | The file contains an array or a scalar | Wrap it in one object |
 | `… needs MY_KEY in your environment — it is not set` | The key is unset or empty | Export it in the shell that starts pi |
-| `… needs X, which is not in envAllowlist` | A plugin route's key, which the scrubbed child environment does not carry | Add the variable name to `envAllowlist` |
+| `… needs X, which is not in envAllowlist` | A plugin route's key, which the scrubbed child environment does not carry. Inert while `/dsh-model` points at a configured provider | Add the variable name to `envAllowlist` in `~/.pi/agent/pi-dsh/config.json` when you intend to select that route; leave it out otherwise |
 | `permissionMode must be one of read-only, workspace-write, danger-full-access` | A typo such as `readonly` | Write the mode exactly; pi-dsh refuses rather than guessing a safer one |
 | `dsh pins a session's permissions for life` | A follow-up asked for a different mode than the session already holds | Start a new session; dsh records a session's mode and will not change it |
 | `there is no session #7 in this project` | Deleted, or pruned after `pruneAfterHours` | `/dsh-sessions`; start a new one with `/dsh` |
