@@ -2,6 +2,7 @@
 	"name": "pi-dsh-adviser",
 	"version": "0.2.3",
 	"description": "Pi extension that turns a DeepSeek Harness runtime into an external adviser: its own context, its own model, per-project adviser sessions",
+	"author": "kslamph",
 	"keywords": [
 		"pi-package",
 		"pi-extension",
